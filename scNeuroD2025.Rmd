@@ -1,0 +1,650 @@
+---
+  title: "scRNAseq_NeuroD"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r install}
+#SETPROXY
+# Sys.setenv("http_proxy" = "http://proxy.charite.de:8080")
+# Sys.setenv("https_proxy" = "https://proxy.charite.de:8080")
+# library(httr)
+# set_config(use_proxy(url="http://proxy/charite.de",port=8080))
+#UNSET
+# Sys.setenv("http_proxy" = "")
+# Sys.setenv("https_proxy" = "")
+# BiocManager::install("Seurat")
+# BiocManager::install("patchwork")
+# BiocManager::install("glmGamPoi")
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(future)
+library(ggplot2)
+set.seed(42)
+
+# Set parallelization
+plan("multisession") #sets parallelization from future package without arguments takes all available cores. can specify with workers = "6" 
+
+```
+
+```{r seurat_standard}
+
+library(Seurat)
+library(Azimuth)
+library(celldex)
+library(glmGamPoi)
+library(ggplot2)
+library(cowplot)
+library(future)
+library(DoubletFinder)  
+library(dplyr)          
+
+
+# Set working directory 
+
+work_dir <- "~/SynologyDrive/NeuroD_2024/"
+setwd(work_dir)
+plotdir <- file.path(work_dir, "plots")
+dir.create(plotdir, showWarnings = FALSE)
+cellranger_dir <- "/Volumes/centren/AG/AG-Newman/Newman/NeuroD scRNAseq/2024/A4794/"
+
+
+
+# Load data
+# Adjust each path to point to the folder containing "raw_feature_bc_matrix"
+# This Data is from E17 cortex
+
+NeuroD1KO <- Read10X(data.dir = file.path(cellranger_dir,
+                                          "A4794_SP278_NeuroD1KO/outs",
+                                          "filtered_feature_bc_matrix"))
+NeuroD2_D6DKO <- Read10X(data.dir = file.path(cellranger_dir,
+                                              "A4794_SP278_NeuroD2_D6DKO/outs",
+                                              "filtered_feature_bc_matrix"))
+NeuroDTKO <- Read10X(data.dir = file.path(cellranger_dir,
+                                          "A4794_SP278_NeuroDTKO/outs",
+                                          "filtered_feature_bc_matrix"))
+WT <- Read10X(data.dir = file.path(cellranger_dir,
+                                   "A4794_SP278_wt/outs",
+                                   "filtered_feature_bc_matrix"))
+
+
+# Prefix cell barcodes to make them unique
+colnames(NeuroD1KO) <- paste0("NeuroD1KO_", colnames(NeuroD1KO))
+colnames(NeuroD2_D6DKO) <- paste0("NeuroD2_D6DKO_", colnames(NeuroD2_D6DKO))
+colnames(NeuroDTKO) <- paste0("NeuroDTKO_", colnames(NeuroDTKO))
+colnames(WT) <- paste0("WT_", colnames(WT))
+
+# Combine matrices (rows are genes, columns are cells)
+
+combined_counts <- cbind(NeuroD1KO, NeuroD2_D6DKO, NeuroDTKO, WT)
+
+
+# Add metadata
+meta_data <- data.frame(
+  Genotype = factor(
+    c(rep("NeuroD1KO", ncol(NeuroD1KO)),
+      rep("NeuroD2_D6DKO", ncol(NeuroD2_D6DKO)),
+      rep("NeuroDTKO", ncol(NeuroDTKO)),
+      rep("WT", ncol(WT))),
+    levels = c("WT", "NeuroD1KO", "NeuroD2_D6DKO", "NeuroDTKO")  # Factor level order
+  ),
+  row.names = colnames(combined_counts)
+)
+
+# Create a Seurat object
+
+options(Seurat.object.assay.calcn = TRUE)
+sc_seurat <- CreateSeuratObject(
+  counts = combined_counts,
+  min.cells = 3,
+  min.features = 200,
+  meta.data = meta_data
+)
+
+#Remove sparse matrices to save RAM
+rm(NeuroD1KO, NeuroD2_D6DKO, NeuroDTKO, WT)
+
+saveRDS(sc_seurat, file = file.path(work_dir, "seurat_pre_filter.rds"))
+# Calculate QC metrics: percent of mitochondrial and ribosomal genes
+
+sc_seurat[["percent.mt"]] <- PercentageFeatureSet(sc_seurat, pattern = "^mt-")
+sc_seurat[["percent.rbp"]] <- PercentageFeatureSet(sc_seurat, pattern = "^Rp[sl]")
+
+# Pre-filter QC plots
+
+VlnPlot(sc_seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.rbp"), ncol = 4)
+ggsave(filename = file.path(plotdir, "QC_combined_pre-filter.pdf"), width = 20, height = 18, units = "cm")
+
+# Filter cells
+# Adjust thresholds as appropriate 
+sc_seurat <- subset(sc_seurat, subset = nFeature_RNA > 400 & percent.mt < 5)
+
+# Post-filter QC plots
+VlnPlot(sc_seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.rbp"), ncol = 4)
+ggsave(filename = file.path(plotdir, "QC_combined_post-filter.pdf"), width = 20, height = 18, units = "cm")
+
+# allow up to 40 GB
+options(future.globals.maxSize = 40 * 1024^3)
+plan("multicore")
+
+# Standard workflow: normalization, feature selection, scaling, PCA, UMAP
+sc_seurat <- sc_seurat %>%
+  NormalizeData() %>%
+  FindVariableFeatures(selection.method = "vst", nfeatures = 2000) %>%
+  ScaleData() %>%
+  RunPCA() %>%
+  RunUMAP(dims = 1:30)
+
+DimPlot(sc_seurat, split.by = "Genotype")
+ggsave(filename = file.path(plotdir, "UMAP_post-filter_pre_doublet_removal.pdf"), width = 30, height = 15, units = "cm")
+
+# Doublet detection with DoubletFinder
+# Split by genotype, run DoubletFinder on each subset, then merge back
+
+seurat_list <- SplitObject(sc_seurat, split.by = "Genotype")
+
+doublet_dir <- file.path(plotdir, "DoubletFinder")
+dir.create(doublet_dir, showWarnings = FALSE)
+
+doublet_metrics <- list()
+
+for (i in seq_along(seurat_list)) {
+  sample_name <- names(seurat_list)[i]
+  message("Processing sample: ", sample_name)
+  
+  DefaultAssay(seurat_list[[i]]) <- "RNA"
+  
+  # Find neighbors/clusters
+  seurat_list[[i]] <- FindNeighbors(seurat_list[[i]], dims = 1:30)
+  seurat_list[[i]] <- FindClusters(seurat_list[[i]], resolution = 0.4)
+  
+  # Parameter sweep
+  sweep.res <- paramSweep(seurat_list[[i]], PCs = 1:30, sct = FALSE)
+  sweep.stats <- summarizeSweep(sweep.res, GT = FALSE)
+  bcmvn <- find.pK(sweep.stats)
+  
+  # Optimal pK
+  optimal.pK <- as.numeric(as.character(bcmvn[which.max(bcmvn$BCmetric), "pK"]))
+  
+  # Homotypic doublet proportion
+  annotations <- seurat_list[[i]]@meta.data$seurat_clusters
+  homotypic.prop <- modelHomotypic(annotations)
+  
+  # Number of expected doublets (default 5%; adjust as needed)
+  nExp_poi <- round(ncol(seurat_list[[i]]) * 0.05)
+  nExp_poi.adj <- round(nExp_poi * (1 - homotypic.prop))
+  
+  # Run DoubletFinder
+  seurat_list[[i]] <- doubletFinder(
+    seurat_list[[i]],
+    PCs = 1:30,
+    pN = 0.25,
+    pK = optimal.pK,
+    nExp = nExp_poi.adj,
+    reuse.pANN = FALSE,
+    sct = FALSE
+  )
+  
+  # Identify the classification column from DoubletFinder
+  classification_col <- grep("^DF.classifications_", 
+                             colnames(seurat_list[[i]]@meta.data), 
+                             value = TRUE)
+  
+  # Visualize doublets vs. singlets
+  DimPlot(seurat_list[[i]], reduction = "umap", group.by = classification_col) +
+    ggtitle(paste0("DoubletFinder Results: ", sample_name)) +
+    theme(plot.title = element_text(hjust = 0.5))
+  ggsave(filename = file.path(doublet_dir, paste0(sample_name, "_DoubletFinder_UMAP.pdf")),
+         width = 10, height = 8)
+  
+  # Collect metrics
+  total_cells <- ncol(seurat_list[[i]])
+  doublet_count <- sum(seurat_list[[i]]@meta.data[[classification_col]] == "Doublet")
+  singlet_count <- sum(seurat_list[[i]]@meta.data[[classification_col]] == "Singlet")
+  
+  doublet_metrics[[sample_name]] <- data.frame(
+    Sample = sample_name,
+    Total_Cells = total_cells,
+    Expected_Doublets = nExp_poi,
+    Adjusted_Expected_Doublets = nExp_poi.adj,
+    Doublet_Count = doublet_count,
+    Singlet_Count = singlet_count
+  )
+  
+  # Keep only singlets
+  singlet_cells <- rownames(
+    seurat_list[[i]]@meta.data[
+      seurat_list[[i]]@meta.data[[classification_col]] == "Singlet", ]
+  )
+  seurat_list[[i]] <- subset(seurat_list[[i]], cells = singlet_cells)
+  
+  # Optionally remove other assays to reduce object size
+  seurat_list[[i]] <- DietSeurat(seurat_list[[i]], assays = "RNA")
+}
+
+# -------------------------------------------------------------------------
+# Merge cleaned samples back together
+# -------------------------------------------------------------------------
+sc_seurat <- merge(seurat_list[[1]], y = seurat_list[-1])
+sc_seurat <- JoinLayers(sc_seurat)  # if needed for Seurat layering
+
+# Combine doublet metrics into a single data frame
+metrics_df <- do.call(rbind, doublet_metrics)
+
+# Save metrics to CSV
+write.csv(metrics_df,
+          file = file.path(doublet_dir, "DoubletFinder_Metrics_All_Samples.csv"),
+          row.names = FALSE)
+
+# Re-run standard workflow after doublet removal
+
+sc_seurat <- sc_seurat %>%
+  NormalizeData() %>%
+  FindVariableFeatures(selection.method = "vst", nfeatures = 2000) %>%
+  ScaleData() %>%
+  RunPCA() %>%
+  RunUMAP(dims = 1:30) %>%
+  FindNeighbors(dims = 1:30) %>%
+  FindClusters(resolution = 0.5)
+
+DimPlot(sc_seurat, split.by = "Genotype")
+ggsave(filename = file.path(plotdir, "UMAP_post-filter_post_doublet_removal.pdf"), width = 30, height = 15, units = "cm")
+
+# Run Azimuth
+DefaultAssay(sc_seurat) <- "RNA"
+sc_seurat <- NormalizeData(sc_seurat) 
+sc_seurat <- Azimuth::RunAzimuth(sc_seurat, reference = "mousecortexref")
+
+saveRDS(sc_seurat, file = file.path(work_dir,"scNeuroD_2025_doublet_Removed_azimuth.rds"))
+
+```
+
+
+```{r dimPlots}
+
+library(Seurat)
+library(Azimuth)
+library(celldex)
+library(glmGamPoi)
+library(ggplot2)
+library(cowplot)
+library(future)
+library(DoubletFinder)  
+library(dplyr)          
+
+work_dir <- "~/SynologyDrive/NeuroD_2024/"
+setwd(work_dir)
+plotdir <- file.path(work_dir, "plots")
+dir.create(plotdir, showWarnings = FALSE)
+sc_seurat <- readRDS(file = "~/SynologyDrive/NeuroD_2024/scNeuroD_2025_doublet_Removed_azimuth.rds")
+
+sc_seurat@meta.data$Genotype <- factor(sc_seurat@meta.data$Genotype, levels = c("WT","NeuroD1KO","NeuroD2_D6DKO","NeuroDTKO"))
+
+# Visualize Azimuth predictions
+DimPlot(sc_seurat, reduction = "ref.umap", group.by = "predicted.subclass", label = TRUE, pt.size = 0.1) +
+  ggtitle("Azimuth Predicted Annotations") + coord_fixed()
+ggsave(paste0(plotdir, "/Dimplot_Azimuth_combined_subclass_refUMAP.pdf"), plot = last_plot(), width = 8, height = 6)
+
+DimPlot(sc_seurat, reduction = "ref.umap", group.by = "predicted.class", label = TRUE, pt.size = 0.1) +
+  ggtitle("Azimuth Predicted Annotations") + coord_fixed()
+ggsave(paste0(plotdir, "/Dimplot_Azimuth_combined_class_refUMAP.pdf"), plot = last_plot(), width = 6, height = 5)
+
+DimPlot(sc_seurat, reduction = "ref.umap", group.by = "Genotype", label = FALSE, pt.size = 0.1) +
+  ggtitle("Azimuth Predicted Annotations") + coord_fixed()
+ggsave(paste0(plotdir, "/Dimplot_Azimuth_combined_Genotype_refUMAP.pdf"), plot = last_plot(), width = 6, height = 5)
+
+DimPlot(sc_seurat, reduction = "ref.umap", group.by = "Genotype", label = FALSE, split.by = "Genotype", pt.size = 0.1) +
+  ggtitle("Azimuth Predicted Annotations") + coord_fixed()
+ggsave(paste0(plotdir, "/Dimplot_Azimuth_combined_Genotype_split_refUMAP.pdf"), plot = last_plot(), width = 12, height = 5)
+
+DimPlot(sc_seurat, reduction = "ref.umap", group.by = "predicted.class", label = TRUE, pt.size = 0.1) +
+  ggtitle("Azimuth Predicted Annotations") + coord_fixed()
+ggsave(paste0(plotdir, "/Dimplot_Azimuth_combined_class_refUMAP.pdf"), plot = last_plot(), width = 6, height = 5)
+
+# Visualize clusters
+DimPlot(sc_seurat, reduction = "umap", group.by = "predicted.class", label = TRUE, pt.size = 0.1) +
+  ggtitle("UMAP Clustering") + coord_fixed()
+ggsave(paste0(plotdir, "/Dimplot_azimuth_class_clustering_UMAP.pdf"), plot = last_plot(), width = 6, height = 5)
+
+# Visualize clusters
+DimPlot(sc_seurat, reduction = "umap", group.by = "predicted.subclass", label = TRUE, pt.size = 0.1) +
+  ggtitle("UMAP Clustering") + coord_fixed()
+ggsave(paste0(plotdir, "/Dimplot_azimuth_subclass_clustering_UMAP.pdf"), plot = last_plot(), width = 6, height = 5)
+
+# Visualize clusters
+DimPlot(sc_seurat, reduction = "umap", group.by = "predicted.subclass", label = FALSE, split.by = "Genotype",pt.size = 0.1) +
+  ggtitle("UMAP Clustering") + coord_fixed()
+ggsave(paste0(plotdir, "/Dimplot_azimuth_subclass_clustering_split_by_genotype_UMAP.pdf"), plot = last_plot(), width = 18, height = 5)
+
+
+```
+
+
+```{r plot_functions}
+
+# Function to generate FeaturePlots for a list of genes and save each plot
+save_feature_plots <- function(seurat_obj, genes, plotdir, reduction = "ref.umap", assay = "RNA") {
+  # Ensure the directory exists
+  if (!dir.exists(plotdir)) dir.create(plotdir, recursive = TRUE)
+  
+  # Set default assay
+  DefaultAssay(seurat_obj) <- assay
+  
+  # Loop through each gene and generate FeaturePlot
+  for (gene in genes) {
+    # Generate the plot
+    plot <- FeaturePlot(seurat_obj, 
+                        reduction = reduction, 
+                        order = TRUE, 
+                        features = gene, 
+                        coord.fixed = TRUE,
+                        pt.size = 0.1
+                        ) +
+    scale_color_gradient(low = "lightblue", high = "darkblue") +
+    xlab("UMAP 1")+
+    ylab("UMAP 2")
+    # Save the plot to a PDF file
+    file_name <- paste0(plotdir, "/", gene, "_expression_all_", reduction, ".pdf")
+    ggsave(file_name, plot = plot, width = 6, height = 5, dpi = 300)
+    
+    # Print a message for progress tracking
+    message("Saved FeaturePlot for gene: ", gene)
+  }
+}
+
+save_feature_plots_split <- function(seurat_obj, genes, plotdir, reduction = "ref.umap", assay = "RNA") {
+  # Ensure the directory exists
+  if (!dir.exists(plotdir)) dir.create(plotdir, recursive = TRUE)
+  
+  # Set default assay
+  DefaultAssay(seurat_obj) <- assay
+  
+  # Loop through each gene and generate FeaturePlot
+  for (gene in genes) {
+    # Generate the plot
+    plot <- FeaturePlot(seurat_obj, 
+                        reduction = reduction, 
+                        split.by = "Genotype",
+                        order = TRUE, 
+                        features = gene,
+                        pt.size = 0.1,
+                        cols = c("lightblue","darkblue"),
+                        coord.fixed = TRUE
+                        ) +
+    theme(
+        legend.position = "right",  # Ensure the legend is shown
+        legend.title = element_text(size = 10),
+        legend.text = element_text(size = 8)
+    )+
+    xlab("UMAP 1")+
+    ylab("UMAP 2")
+    # Save the plot to a PDF file
+    file_name <- paste0(plotdir, "/", gene,  "_expression_all_split_by_genotype_", reduction, ".pdf")
+    ggsave(file_name, plot = plot, width = 12, height = 5, dpi = 300)
+    
+    # Print a message for progress tracking
+    message("Saved FeaturePlot Split for gene: ", gene)
+  }
+}
+
+```
+
+
+```{r Gene_UMAPs}
+
+# Define the list of genes
+gene_list <- c("Nr4a2", "Rorb", "Neurod1", "Satb2","Bcl11b",
+               "Fezf2","Unc5d","Cux2","Cux1","Eomes","Pax6","Neurod2","Neurod6","Btg2","Id2","Id3",
+               "Epha3","Robo2","Top2a","Hs6st3","Tafa2", "Gad2", "Lhx6","Reln","Rmst","Nfib","Zbtb20")
+
+
+# Marker genes to include
+"Scrt2"
+
+Idents(sc_seurat) <- "Genotype"
+NdDKO <- subset(sc_seurat, Genotype %in% c("WT","NeuroD2_D6DKO"))
+Idents(NdDKO) <- "seurat_clusters"
+markers <- FindAllMarkers(NdDKO)
+
+markers <- subset(markers, p_val_adj < 0.0001)
+markers <- subset(markers, abs(avg_log2FC) > 2 )
+markers.clust6 <- subset(markers, cluster == "6")
+
+write.table(markers.clust6, file = "differential_genes_from_DKO_unique_cluster.csv", sep = ",")
+
+Cdk14, Sox6, Npas3, Ntng2, Sox2ot, Dach1, Dpp10, Gad1, Tcf712, Dgkg
+
+# Define the output directory
+output_dir <- file.path(plotdir, "gene_umaps")
+
+# Run the functions
+save_feature_plots(sc_seurat, genes = gene_list, reduction = "umap", plotdir = output_dir)
+save_feature_plots(sc_seurat, genes = gene_list, reduction = "ref.umap", plotdir = output_dir)
+save_feature_plots_split(sc_seurat, genes = gene_list, reduction = "umap", plotdir = output_dir)
+save_feature_plots_split(sc_seurat, genes = gene_list, reduction = "ref.umap", plotdir = output_dir)
+
+```
+
+```{r subset}
+
+# Set default assay to RNA for Azimuth
+DefaultAssay(sc_seurat) <- "RNA"
+
+# subset to just WT and NeuroD2 NeuroD6 DKO
+NdDKO <- subset(sc_seurat, Genotype %in% c("WT","NeuroD2_D6DKO"))
+
+# Subset to Tbr2 positive fraction
+Tbr2.pos <- subset(NdDKO, Eomes > 0) %>%
+  DietSeurat(assays = "RNA", dimreducs = NULL)
+
+# Set default assay to RNA for Azimuth
+DefaultAssay(Tbr2.pos) <- "RNA"
+
+# Normalize the data for Azimuth
+Tbr2.pos <- NormalizeData(Tbr2.pos)
+
+# Run Azimuth
+# not run, this is for adult cortex and cannot annotate embyronic
+#Tbr2.pos <- Azimuth::RunAzimuth(Tbr2.pos, reference = "mousecortexref")
+
+# Standard seurat workflow
+Tbr2.pos <- Tbr2.pos %>%
+  FindVariableFeatures(selection.method = "vst", nfeatures = 2000) %>%
+  ScaleData() %>%
+  RunPCA(npcs = 30, verbose = FALSE) %>%
+  RunUMAP(reduction = "pca", 
+          dims = 1:30,
+          n.neighbors = 20,  # Smaller neighborhood for tighter clusters
+          min.dist = 0.2,    # Smaller minimum distance for closer points
+          verbose = FALSE) %>%
+  FindNeighbors(dims = 1:30, k.param = 10, verbose = FALSE) %>%
+  FindClusters(algorithm = 1, resolution = 0.2, verbose = FALSE)
+
+# Visualize Azimuth predictions
+DimPlot(Tbr2.pos,  label = TRUE) +
+  ggtitle("Tbr2+ Cells")
+
+DefaultAssay(Tbr2.pos) <- "RNA"
+FeaturePlot(Tbr2.pos, features = "Eomes", split.by = "Genotype", pt.size = 0.1)
+
+subset_dir <- file.path(plotdir, "Tbr2_positive_gene_umaps")
+save_feature_plots(Tbr2.pos, genes = gene_list, reduction = "umap", plotdir = subset_dir )
+save_feature_plots_split(Tbr2.pos, genes = gene_list, reduction = "umap", plotdir = subset_dir )
+
+
+
+```
+
+
+```{r DEresults}
+
+Tbr2.pos <- sc_seurat
+
+Idents(Tbr2.pos) <- "seurat_clusters"
+Tbr2DEclust <- FindAllMarkers(Tbr2.pos)
+
+Tbr2DEclust <- subset(Tbr2DEclust, p_val_adj < 0.0001  )
+
+
+
+Idents(Tbr2.pos) <- "Genotype"
+Tbr2DE <- FindMarkers(Tbr2.pos, 
+                       ident.1 = "NeuroD2_D6DKO",
+                       ident.2 = "WT", 
+                       min.pct = 0.1, 
+                       logfc.threshold = 1
+                       )
+
+Tbr2DE.top <- subset(Tbr2DE, abs(avg_log2FC) > 1 & p_val_adj < 0.01)
+
+write.table(Tbr2DE.top, file = "Tbr2_positive_cells_DKO_vs_WT_log2FC_1_padj_0.01.csv", sep = ",")
+
+DotPlot(sc_seurat, features = c("Eomes","Pax6","Satb2"))
+
+
+DE_results <- list()
+Idents(Tbr2.pos) <- "seurat_clusters"
+# Loop through each subclass and calculate DE between Genotypes (WT vs. Nurr1KO)
+for (subclass in unique(Tbr2.pos$seurat_clusters)) {
+  subclass_cells <- subset(Tbr2.pos, idents = subclass)  # Subset cells for the subclass
+  Idents(subclass_cells) <- "Genotype"  # Set identity to Genotype
+  DE_results[[subclass]] <- FindMarkers(subclass_cells, ident.1 = "NeuroD2_D6DKO", ident.2 = "WT", min.pct = 0.1, logfc.threshold = 1)
+}
+
+# Extract top genes for each subclass
+top_genes_by_cluster <- unique(unlist(lapply(DE_results, function(x) {
+  # Filter DE results by p-value, log2FC, and percent expression thresholds
+  x <- x[x$p_val_adj < 0.01 & 
+           abs(x$avg_log2FC) > 1 &
+            x$pct.1 > 0.1 &
+            x$pct.2 > 0.1
+         , ]
+  # Select the top 200 genes based on log2 fold change
+  rownames(head(x[order(-abs(x$avg_log2FC)), ], 200))  
+})))
+
+# Create a combined grouping column
+Tbr2.pos$cluster_genotype <- paste(Tbr2.pos$seurat_clusters, Tbr2.pos$Genotype, sep = "_")
+
+# Generate the heatmap grouped by the combined field
+DoHeatmap(
+  object = Tbr2.pos,
+  features = top_genes_by_cluster,  # Top DE genes
+  group.by = "seurat_clusters",  # Group cells by subclass and genotype
+  cells = colnames(Tbr2.pos),  # Use all cells
+  group.bar = TRUE,  # Add a group bar
+  label = TRUE  # Label clusters or groups
+) + ggtitle("Heatmap of Top DE Genes by Subclass and Genotype")
+
+top_genes <- unique(top_genes_by_cluster, rownames(Tbr2DE.top))
+
+
+Idents(Tbr2.pos) <- "seurat_clusters"
+DotPlot(Tbr2.pos, assay = "RNA",
+        features = top_genes, group.by = "seurat_clusters", split.by = "Genotype") + coord_flip() +RotatedAxis()
+
+```
+```{r heatmap}
+library(ComplexHeatmap)
+library(circlize)
+
+# Set the Default Assay to RNA
+DefaultAssay(Tbr2.pos) <- "RNA"
+
+# Ensure data is scaled
+Tbr2.pos <- ScaleData(Tbr2.pos, features = rownames(Tbr2.pos))
+
+# Extract scaled expression data
+expression_matrix <- GetAssayData(Tbr2.pos, layer = "scale.data")
+
+# Subset the matrix for top genes
+expression_matrix <- expression_matrix[intersect(rownames(expression_matrix), top_genes), ]
+
+# Match cell metadata for column annotations
+annotation_data <- Tbr2.pos@meta.data[colnames(expression_matrix), c("seurat_clusters", "Genotype")]
+
+annotation_data$Genotype <- factor(annotation_data$Genotype, levels = c("WT","NeuroD2_D6DKO"))
+
+# Create a custom column ordering: sort by subclass, then genotype
+column_order <- order(annotation_data$Genotype, annotation_data$predicted.subclass )
+
+# Reorder the expression matrix and annotations
+expression_matrix <- expression_matrix[, column_order]
+annotation_data <- annotation_data[column_order, ]
+
+# Create named color vectors for annotations
+subclass_colors <- setNames(rainbow(length(unique(annotation_data$predicted.subclass))),
+                            unique(annotation_data$predicted.subclass))
+genotype_colors <- c("WT" = "grey80", "NeuroD2_D6DKO" = "maroon")
+
+# Create column annotation for subclasses and genotypes
+col_annotation <- HeatmapAnnotation(
+  Genotype = annotation_data$Genotype,
+  Subclass = annotation_data$predicted.subclass,
+  col = list(
+    Genotype = genotype_colors,
+    Subclass = subclass_colors
+  )
+)
+
+always_label_genes <- gene_list
+
+# Indices of genes to always label
+always_label_indices <- which(rownames(expression_matrix) %in% always_label_genes)
+
+# Step through and label every 4th gene
+step_indices <- seq(1, nrow(expression_matrix), by = 5)  # Use nrow to reference row indices
+
+# Combine the indices and ensure uniqueness and sorting
+combined_indices <- unique(sort(c(step_indices, always_label_indices)))
+
+# Extract the gene names for the combined indices
+combined_labels <- rownames(expression_matrix)[combined_indices]
+
+
+# Create the row annotations
+genelabels <- rowAnnotation(
+  Genes = anno_mark(
+    at = combined_indices,
+    labels = combined_labels,
+    labels_gp = gpar(fontsize = 11, fontface = 'italic'),
+    padding = 0.5),
+  width = unit(2.0, 'cm') +
+    max_text_width(
+      combined_labels,
+      gp = gpar(fontsize = 11, fontface = 'italic'))
+)
+
+# Generate the heatmap with custom column ordering
+heat<-Heatmap(expression_matrix,
+        name = "Scaled Expression",  # Legend title
+        top_annotation = col_annotation,  # Column annotations
+        show_row_names = TRUE,  # Show gene names
+        show_column_names = FALSE,  # Hide cell names
+        cluster_rows = TRUE, 
+        column_split = annotation_data$Genotype,# Cluster genes
+        cluster_columns = FALSE,  # Do not cluster columns; use custom order
+        column_title = "Genotype and Predicted Subclass",
+        row_title = "Top Genes",
+        row_km = 2,
+        row_gap = unit(0.5, "mm"),
+        column_gap = unit(0.5, "mm"),
+        clustering_method_rows = "ward.D2", 
+        #clustering_distance_rows = "euclidean",
+        use_raster = TRUE,
+        raster_by_magick = TRUE,
+        col = colorRamp2(c(-3, 0, 3), hcl_palette = "Spectral"),
+        heatmap_legend_param = list(title = "Scaled Expression"))
+pdf("___heatmap_sort_geno_no_column_cluster.pdf", width=8,height = 8)
+heat+genelabels
+dev.off()
+
+
+
+```

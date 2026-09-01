@@ -1,0 +1,2404 @@
+---
+title: "NeuroD2/NeuroD6 DKO scRNA-seq — 2026 revision analysis (res-0.9 clustering, two misspecified clusters)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+<!--
+==============================================================================
+WHAT THIS FILE IS
+
+The 2026 revision analysis as originally specified: the saved object is
+RE-CLUSTERED at resolution 0.9, which splits the DKO-specific population into TWO
+misspecified clusters, "Misspecified UL" and "Misspecified DL".
+
+The one-cluster version lives in a separate notebook, ../1_misspecified_cluster/,
+deliberately NOT behind a parameter: each clustering needs its own hand-assigned
+numeric -> celltype mapping, and a single file switching between two of them
+would mislabel everything silently if either clustering shifted. Each notebook
+instead ASSERTS its own mapping against known per-cluster cell counts (see
+`load_object`), so a changed clustering fails loudly instead of quietly
+relabelling.
+
+The res-0.9 clustering and its naming were verified to reproduce the archived
+2026 run exactly: all 21 named clusters match the per-cluster cell counts in
+Revision_Genotype_changes_DKO_vs_WT_ALL_clusters.csv, cell for cell.
+
+Code fixes relative to the original scNeuroD_DKO_2026_revision.Rmd (which no
+longer runs as written on this machine) are documented inline; the analysis
+methodology is unchanged.
+
+Downstream methodology carried over from scNeuroD_DKO_2026_revision.Rmd:
+  * pseudobulk (CPM) within-cluster DKO-vs-WT log2FC instead of per-cell
+    FindMarkers p-values, which are invalid at n = 1 per genotype
+  * one-vs-rest contrast for the genotype-private (DKO-only) clusters
+  * reworked cell-level and log2FC heatmaps
+  * GSEA / ORA with gene-by-cluster tileplots
+  * recovery-independent composition and proportion analyses
+
+Sources merged here:
+  scNeuroD2025.Rmd               (the 2025 analysis)
+  scNeuroD_DKO_2026_revision.Rmd (the 2026 downstream methods + res-0.9 names)
+  ../scNeuroD_DKO_2025.Rmd       (the 2025 res-0.5 cluster names for this object)
+
+INPUT OBJECT - READ ONLY
+  scNeuroD_DKO_2025_doublet_Removed_azimuth.rds is only ever read. Nothing in
+  this file writes to that path. Any derived object is saved under a new name.
+
+PRE-PROCESSING is NOT repeated here. Cell Ranger loading, QC filtering,
+DoubletFinder and Azimuth - everything that produced the .rds this notebook
+reads - lives in ../00_preprocessing_make_rds.R, extracted verbatim from the
+`seurat_standard` chunk of scNeuroD_DKO_2026_revision.Rmd. That script refuses to
+overwrite the existing object and needs packages not installed here (Azimuth,
+DoubletFinder, celldex) plus the Cell Ranger outputs on /Volumes/centren.
+==============================================================================
+-->
+
+```{r setup, include=FALSE}
+# Figures are written to plots/ AND embedded in this report. Bulk per-gene /
+# per-term loops are excluded (see save_plot's `show` argument) or the HTML would
+# run to thousands of panels.
+# Quiet by default. Seurat/ggplot2/clusterProfiler emit ~500 lines of
+# incidental notes over a full run (one "Scale for colour is already present"
+# pair per gene, one "select() returned 1:1 mapping" per ORA call, a "Wrote ..."
+# per file), which buries the actual results. Chunks whose log is worth reading
+# re-enable messages individually via `message=TRUE` in their header.
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 7, fig.align = "center",
+                      dev = "png", dpi = 110, out.width = "100%")
+
+# knitr resets the working directory after every chunk, so every path below is
+# built from these constants rather than from setwd(). The input object lives at
+# the project root and is shared with the two-cluster analysis; all OUTPUT stays
+# inside this analysis directory.
+PROJ_DIR     <- path.expand("~/SynologyDrive/NeuroD_2024/Revision July 28")
+ANALYSIS_DIR <- file.path(PROJ_DIR, "2_misspecified_clusters")
+knitr::opts_knit$set(root.dir = ANALYSIS_DIR)
+```
+
+# Configuration
+
+Sets up the analysis: packages, paths, the helpers that write every figure and table, the parallel backend, genotype labels, cluster names and their display order, and the curated gene lists. It also probes for a working raster device, because the default one fails on this machine.
+
+No figures are produced here.
+
+```{r config, message=TRUE}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(purrr)
+  library(Matrix)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(future)
+  library(future.apply)
+})
+# clusterProfiler / org.Mm.eg.db / fgsea / enrichplot are called with :: so they
+# also work inside multisession workers, which do not inherit attached packages.
+
+set.seed(42)
+
+# ---------------------------------------------------------------------------
+# Paths. The input .rds is READ-ONLY and shared with the two-cluster analysis;
+# every output goes under this analysis directory as plots/ and tables/.
+# ---------------------------------------------------------------------------
+RDS_PATH  <- file.path(PROJ_DIR, "scNeuroD_DKO_2025_doublet_Removed_azimuth.rds")
+PLOT_DIR  <- file.path(ANALYSIS_DIR, "plots")
+TABLE_DIR <- file.path(ANALYSIS_DIR, "tables")
+dir.create(PLOT_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(TABLE_DIR, recursive = TRUE, showWarnings = FALSE)
+
+stopifnot(file.exists(RDS_PATH))
+
+# ---------------------------------------------------------------------------
+# Output helpers. Every plot and table in this file goes through these, so the
+# directory always exists, the path is always absolute, and nothing depends on
+# ggplot2's last_plot() side effect.
+# ---------------------------------------------------------------------------
+
+#' Save a ggplot under PLOT_DIR. `path` is relative, e.g. "GSEA/dotplot.pdf".
+#' `quiet = TRUE` suppresses the per-file message; used by the violin loops,
+#' which write thousands of files and would otherwise bury the log.
+#' `show = TRUE` also prints the figure so knitr embeds it in the report. Bulk
+#' loops pass show = FALSE: there are thousands of them, and they run inside
+#' parallel workers whose graphics output knitr cannot capture in any case.
+save_plot <- function(plot, path, width, height, units = "in", dpi = 300,
+                      quiet = FALSE, show = TRUE) {
+  full <- file.path(PLOT_DIR, path)
+  dir.create(dirname(full), recursive = TRUE, showWarnings = FALSE)
+  suppressWarnings(
+    ggplot2::ggsave(full, plot = plot, width = width, height = height,
+                    units = units, dpi = dpi, limitsize = FALSE)
+  )
+  if (!quiet) message("Wrote ", full)
+  if (show) print(plot)
+  invisible(full)
+}
+
+#' Save base/grid graphics (ComplexHeatmap) under PLOT_DIR. `expr` is evaluated
+#' lazily, once the pdf device is open.
+#' `expr` is captured unevaluated and drawn twice: once into the PDF, once to
+#' the active device so knitr embeds it in the report.
+save_pdf <- function(path, width, height, expr, show = TRUE) {
+  e  <- substitute(expr)
+  pf <- parent.frame()
+  full <- file.path(PLOT_DIR, path)
+  dir.create(dirname(full), recursive = TRUE, showWarnings = FALSE)
+  grDevices::pdf(full, width = width, height = height)
+  tryCatch(eval(e, pf), finally = {
+    grDevices::dev.off(); message("Wrote ", full)
+  })
+  if (show) eval(e, pf)
+  invisible(full)
+}
+
+# ---------------------------------------------------------------------------
+# Raster backend for ComplexHeatmap. This governs how ~31,000 cell columns are
+# reduced to a few thousand pixels, and it is the single biggest factor in how
+# the cell heatmaps look.
+#
+# Two independent traps:
+#
+# 1. DEVICE. ComplexHeatmap forces type = "cairo" whenever capabilities("cairo")
+#    is TRUE. Here that flag is TRUE (cairo is compiled in) but the DLL cannot
+#    load at runtime - XQuartz/libXrender is absent - so every rasterised heatmap
+#    dies with "unable to open ...heatmap_body_....png". ragg::agg_png has no X11
+#    dependency and is preferred when available.
+#
+# 2. RESAMPLING. Without the magick package, ComplexHeatmap point-samples the
+#    matrix into the raster image and most of the structure is thrown away; with
+#    magick it resamples properly. Rendering the 2026 pyramidal figure both ways
+#    gives 176 KB (no magick) vs 270 KB (agg_png + magick), and the latter
+#    matches the archived 2026 PDF (271 KB) to within 0.5%. That difference is
+#    purely rasterisation - identical genes, identical cells.
+# ---------------------------------------------------------------------------
+RASTER_BACKEND <- local({
+  # A failing png() type warns and leaves the null device active rather than
+  # erroring, and a quartz device only writes its file once something has been
+  # drawn - so the probe must open, draw, close, and then check for output.
+  device_works <- function(type) {
+    f <- tempfile(fileext = ".png")
+    before <- grDevices::dev.cur()
+    suppressWarnings(try(grDevices::png(f, width = 64, height = 64, type = type),
+                         silent = TRUE))
+    opened <- grDevices::dev.cur() != before
+    if (!opened) return(FALSE)
+    suppressWarnings(try(graphics::plot.new(), silent = TRUE))
+    grDevices::dev.off()
+    file.exists(f) && file.size(f) > 0
+  }
+  if (requireNamespace("ragg", quietly = TRUE))
+    list(device = "agg_png", param = list())
+  else if (capabilities("cairo") && device_works("cairo"))
+    list(device = "png", param = list(type = "cairo"))
+  else if (capabilities("aqua") && device_works("quartz"))
+    list(device = "png", param = list(type = "quartz"))
+  else
+    list(device = "png", param = list())
+})
+if (!requireNamespace("magick", quietly = TRUE))
+  warning("magick is not installed - heatmap bodies will be point-sampled and ",
+          "will look much coarser. install.packages('magick')", call. = FALSE)
+message("Heatmap raster backend: ", RASTER_BACKEND$device,
+        if (length(RASTER_BACKEND$param)) paste0(" (", RASTER_BACKEND$param$type, ")") else "",
+        " | magick resampling: ", requireNamespace("magick", quietly = TRUE))
+
+#' Save a data frame as CSV under TABLE_DIR.
+save_table <- function(df, path) {
+  full <- file.path(TABLE_DIR, path)
+  dir.create(dirname(full), recursive = TRUE, showWarnings = FALSE)
+  utils::write.csv(df, full, row.names = FALSE)
+  message("Wrote ", full, " (", nrow(df), " rows)")
+  invisible(full)
+}
+
+#' Filesystem-safe version of a GO term / cluster name.
+safe_name <- function(x) gsub("[^A-Za-z0-9_]", "_", x)
+
+#' Cells belonging to the given named clusters.
+#' Direct column indexing rather than subset(obj, subset = cluster_named %in% x):
+#' subset() evaluates its expression in the metadata environment, which does not
+#' reliably see variables local to a function or a parallel worker.
+cells_in_clusters <- function(obj, clusters) {
+  obj[, as.character(obj$cluster_named) %in% clusters]
+}
+
+# ---------------------------------------------------------------------------
+# Parallel backends. 15 cores / 48 GB on this machine.
+#
+#   plan_fork()    - stages that touch the full Seurat object. Forking shares
+#                    the object copy-on-write instead of serialising it.
+#   plan_session() - stages that call AnnotationDbi/org.Mm.eg.db. Forked
+#                    processes inherit an open SQLite connection, which is not
+#                    safe to use concurrently, so these get fresh R sessions.
+#                    Their inputs (ranked vectors, gene symbols) are tiny.
+#
+# Forking requires a non-interactive session: render with Rscript. Under
+# RStudio the fork plan silently falls back to multisession.
+# ---------------------------------------------------------------------------
+N_WORKERS_HEAVY <- 10L
+N_WORKERS_LIGHT <- 12L
+FORK_OK <- !interactive() && .Platform$OS.type != "windows"
+
+options(future.globals.maxSize = 16 * 1024^3)
+
+plan_fork <- function(n = N_WORKERS_HEAVY) {
+  if (FORK_OK) future::plan(future::multicore, workers = n)
+  else         future::plan(future::multisession, workers = n)
+  invisible(future::nbrOfWorkers())
+}
+plan_session <- function(n = N_WORKERS_LIGHT) {
+  future::plan(future::multisession, workers = n)
+  invisible(future::nbrOfWorkers())
+}
+
+#' Stop nested parallelism. fgsea (under gseGO) and data.table both grab every
+#' core by default; combined with an outer future_lapply that oversubscribes to
+#' 100+ threads and runs slower than serial.
+worker_setup <- function() {
+  Sys.setenv(OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1",
+             VECLIB_MAXIMUM_THREADS = "1")
+  try(data.table::setDTthreads(1), silent = TRUE)
+  try(BiocParallel::register(BiocParallel::SerialParam()), silent = TRUE)
+  invisible(NULL)
+}
+
+message("Parallel backend: ", if (FORK_OK) "multicore (fork)" else "multisession",
+        " | heavy = ", N_WORKERS_HEAVY, " workers, light = ", N_WORKERS_LIGHT)
+
+# ---------------------------------------------------------------------------
+# Genotypes and cluster scopes. Defined ONCE here; the 2026 file redefined these
+# in five different chunks, which is how "Misspecified" drifted out of sync with
+# the values case_when() was producing.
+# ---------------------------------------------------------------------------
+DKO    <- "NeuroD2_D6DKO"
+WT_LAB <- "WT"
+GENOTYPE_COLORS <- c("WT" = "grey80", "NeuroD2_D6DKO" = "firebrick")
+
+# 2026 res-0.9 cluster names (scNeuroD_DKO_2026_revision.Rmd:294). Cluster 10 of
+# the STORED res-0.5 clustering is dropped first - median 548 genes / 812 UMIs
+# per cell against 1400-2200 elsewhere, i.e. low-quality cells, not a cell type -
+# and the remaining cells are then re-clustered at resolution 0.9.
+DROP_CLUSTERS   <- "10"
+RECLUSTER_RES   <- 0.9
+CLUSTER_NAMES <- c(
+  `0`  = "Misspecified UL",   # DKO-specific
+  `1`  = "Basal Progenitor II",
+  `2`  = "Cycling AP",
+  `3`  = "Interneuron I",
+  `4`  = "Basal Progenitor I",
+  `5`  = "Apical Progenitor",
+  `6`  = "Misspecified DL",   # DKO-specific
+  `7`  = "Layer V",
+  `8`  = "Layer VI",
+  `9`  = "Apical Progenitor",
+  `10` = "Basal Progenitor I",   # also hippocampal basal progenitors
+  `11` = "Layer IV",
+  `12` = "Layer IV",
+  `13` = "Layer VI",
+  `14` = "Interneuron III",
+  `15` = "Hippocampal Pyramidal Neuron",
+  `16` = "Interneuron II",
+  `17` = "Layer II/III",
+  `18` = "Layer VIb",
+  `19` = "Layer I",
+  `20` = "Basal Progenitor II",
+  `21` = "Cycling BP",
+  `22` = "Cortical Hem",
+  `23` = "Endothelial Cells",
+  `24` = "Microglia",
+  `25` = "Oligodendrocytes"
+)
+
+# Display / column order used by every heatmap, dotplot and proportion table.
+CLUSTER_ORDER <- c(
+  "Cycling AP", "Cycling BP", "Apical Progenitor",
+  "Basal Progenitor I", "Basal Progenitor II",
+  "Misspecified UL", "Misspecified DL",
+  "Layer VIb", "Layer VI", "Layer V", "Layer IV", "Layer II/III", "Layer I",
+  "Hippocampal Pyramidal Neuron", "Cortical Hem",
+  "Interneuron I", "Interneuron II", "Interneuron III",
+  "Endothelial Cells", "Microglia", "Oligodendrocytes"
+)
+stopifnot(setequal(CLUSTER_ORDER, unname(CLUSTER_NAMES)))
+
+# Genotype-private clusters: DKO-only, so a within-cluster DKO-vs-WT contrast is
+# undefined and they are handled by one-vs-rest throughout.
+PRIVATE_CLUSTERS <- c("Misspecified UL", "Misspecified DL")
+
+PYRAMID_SHARED <- c("Cycling AP", "Cycling BP", "Apical Progenitor",
+                    "Basal Progenitor I", "Basal Progenitor II",
+                    "Layer VIb", "Layer VI", "Layer V", "Layer IV", "Layer II/III")
+PYRAMID_ALL    <- intersect(CLUSTER_ORDER, c(PYRAMID_SHARED, PRIVATE_CLUSTERS))
+INTERNEURON_CLUSTERS <- c("Interneuron I", "Interneuron II", "Interneuron III")
+NEURONAL_CLUSTERS    <- intersect(CLUSTER_ORDER,
+                                  c(PYRAMID_ALL, INTERNEURON_CLUSTERS))
+# "Hippocampal Pyramidal Neuron" is a different population and stays out of the
+# pyramidal scope, as in the original 2026 file.
+
+# Curated genes: always labelled on heatmaps / always given a violin, whether or
+# not they clear the selection cutoffs.
+FORCE_GENES <- c("Eomes", "Crtac1", "Dpf3", "Hrk", "Sorcs1", "Sorcs3")
+
+LABEL_GENES <- unique(c(
+  "Nr4a2","Rorb","Neurod1","Satb2","Bcl11b","Fezf2","Unc5d","Cux2","Cux1",
+  "Eomes","Pax6","Neurod2","Neurod6","Btg2","Id2","Id3","Epha3","Robo2",
+  "Top2a","Hs6st3","Tafa2","Gad2","Lhx6","Reln","Rmst","Nfib","Zbtb20",
+  "Cdk14","Sox6","Npas3","Scrt2","Ntng2","Sox2ot","Dach1","Dpp10","Gad1",
+  "Tcf7l2","Dgkg","Gabra2","Elmod1","Fam135b","Hhip","Gpat3","Adcy7","Dkk2",
+  "Scube2","Crlf1","Sox2","Mki67","Pcna","Tubb3","Dcx","Map2","Ncam1",
+  "Rbfox3","Gap43","Egfr","Bdnf","Eno2","Pou3f3","Pou3f2","Tbr1","Sox5",
+  "Pou3f1","Olig2","Hes1","Hes5","Notch1","Notch2","Robo1","Ebf1","Grin1",
+  "Ebf2","Ebf3","Dll1","Kdm1a","Hdac9","Cdkn1c","Insm1","Smarcd3","Dpf3",
+  "Tiam2","Pak3","Hes6","Gadd45g","Prox1","Emx2","Nhlh1","Ptprd","Bcl11a",
+  "Lmo1","Sema3a","Sema3c","Stk32b","Sla","Sorcs1","Sorcs3","Nrp1","Hrk","Cerkl"
+))
+```
+
+# Load object and apply the 2025 clustering
+
+Reads the pre-processed object (read-only), removes the low-quality cluster, re-clusters the remaining nuclei at resolution 0.9 - the step that splits the DKO-specific population in two, and applies the cluster names. The naming is then **verified** against known per-cluster cell counts, so a changed clustering stops the run rather than silently mislabelling every figure downstream.
+
+No figures; the printed table is the cell count per cluster and genotype.
+
+```{r load_object, message=TRUE}
+# READ ONLY. Never saveRDS() to this path.
+sc_seurat <- readRDS(RDS_PATH)
+DefaultAssay(sc_seurat) <- "RNA"
+
+sc_seurat$Genotype <- factor(as.character(sc_seurat$Genotype),
+                             levels = c(WT_LAB, DKO))
+
+# The stored seurat_clusters IS RNA_snn_res.0.5 - verified identical. Cluster 10
+# is dropped on that stored clustering, then the remaining cells are re-clustered
+# at resolution 0.9. This re-clustering is what splits the misspecified
+# population in two; the sibling notebook keeps the stored res-0.5 clustering.
+stopifnot(identical(as.character(sc_seurat$seurat_clusters),
+                    as.character(sc_seurat$RNA_snn_res.0.5)))
+
+Idents(sc_seurat) <- "seurat_clusters"
+sc_seurat <- subset(sc_seurat, idents = DROP_CLUSTERS, invert = TRUE)
+
+# Re-cluster on the graph already stored in the object (FindNeighbors was run
+# during pre-processing), exactly as the 2026 file did.
+sc_seurat <- FindClusters(sc_seurat, resolution = RECLUSTER_RES, verbose = FALSE)
+sc_seurat$seurat_clusters <- droplevels(factor(sc_seurat$seurat_clusters))
+message("res-", RECLUSTER_RES, " clustering: ",
+        nlevels(sc_seurat$seurat_clusters), " clusters")
+
+Idents(sc_seurat) <- "seurat_clusters"
+sc_seurat <- RenameIdents(sc_seurat, CLUSTER_NAMES)
+sc_seurat$cluster_named <- factor(as.character(Idents(sc_seurat)),
+                                  levels = CLUSTER_ORDER)
+Idents(sc_seurat) <- "cluster_named"
+stopifnot(!any(is.na(sc_seurat$cluster_named)))
+
+# =============================================================================
+# VERIFY THE CLUSTER NAMING.
+#
+# CLUSTER_NAMES is a hand-assigned numeric -> celltype mapping. If the stored
+# clustering ever changed, the numbers would still map silently and every figure
+# would be mislabelled. Assert the resulting per-cluster cell counts against the
+# values this mapping was built from, so a changed clustering fails loudly here
+# rather than producing plausible, wrong output.
+# =============================================================================
+EXPECTED_COUNTS <- c(
+  "Cycling AP" = 2769, "Cycling BP" = 385, "Apical Progenitor" = 4193,
+  "Basal Progenitor I" = 4312, "Basal Progenitor II" = 3351,
+  "Misspecified UL" = 3523, "Misspecified DL" = 2205,
+  "Layer VIb" = 748, "Layer VI" = 3594, "Layer V" = 2033, "Layer IV" = 3538,
+  "Layer II/III" = 1035, "Layer I" = 704,
+  "Hippocampal Pyramidal Neuron" = 1085, "Cortical Hem" = 246,
+  "Interneuron I" = 2723, "Interneuron II" = 1069, "Interneuron III" = 1470,
+  "Endothelial Cells" = 121, "Microglia" = 103, "Oligodendrocytes" = 60)
+
+observed <- table(as.character(sc_seurat$cluster_named))
+if (!setequal(names(observed), names(EXPECTED_COUNTS)) ||
+    !all(observed[names(EXPECTED_COUNTS)] == EXPECTED_COUNTS)) {
+  print(data.frame(cluster = names(EXPECTED_COUNTS),
+                   expected = as.integer(EXPECTED_COUNTS),
+                   observed = as.integer(observed[names(EXPECTED_COUNTS)])))
+  stop("Cluster naming check FAILED: FindClusters at resolution ", RECLUSTER_RES,
+       " no longer reproduces the clustering that CLUSTER_NAMES was built from. ",
+       "Do not trust any downstream labels.")
+}
+# Are the misspecified clusters actually genotype-private?
+# The one-vs-rest contrast used throughout assumes they are.
+#
+# The 2026 methodology applies ONE-VS-REST to both misspecified clusters on the
+# stated grounds that they contain no WT cells. Strictly that holds only for
+# "Misspecified UL" (1 WT / 3522 DKO, 0.03% WT); "Misspecified DL" is
+# 96 WT / 2109 DKO = 4.35% WT.
+#
+# That is NOT a defect of the res-0.9 clustering - it is what the re-clustering
+# is for. All 96 WT cells come from res-0.5 cluster 4, which the sibling analysis
+# calls Layer VIb, and that res-0.5 cluster was itself a mixture at 13.58% WT.
+# Resolution 0.9 splits it:
+#
+#   res-0.5 Layer VIb   3064 cells  13.58% WT
+#     -> Misspecified DL  2197 cells   4.37% WT   (DKO-dominated part)
+#     -> Layer VIb         734 cells  42.78% WT   (near the 32.81% baseline)
+#
+# So the split isolates a DKO-dominated deep-layer population that res 0.5 leaves
+# buried inside Layer VIb. Against the dataset baseline of 32.81% WT, DL is 7.5x
+# depleted for WT and UL is ~1150x depleted. For reference, Misspecified UL is
+# essentially the res-0.5 Misspecified cluster: 3399 of its 3523 cells.
+#
+# The practical consequence is only that for DL the one-vs-rest contrast is an
+# approximation rather than an exact statement - those 96 WT cells sit on the
+# "Misspecified" side of the comparison. The composition is written to tables/ so
+# the caveat travels with the results. The run aborts only if a "private" cluster
+# is majority WT, which would make the framing indefensible rather than imperfect.
+private_composition <- purrr::map_dfr(PRIVATE_CLUSTERS, function(mc) {
+  g <- table(factor(as.character(sc_seurat$Genotype[sc_seurat$cluster_named == mc]),
+                    levels = c(WT_LAB, DKO)))
+  data.frame(cluster_named = mc, n_WT = g[[WT_LAB]], n_DKO = g[[DKO]],
+             pct_WT = round(100 * g[[WT_LAB]] / sum(g), 2))
+})
+print(private_composition)
+save_table(private_composition, "misspecified_cluster_genotype_composition.csv")
+
+for (i in seq_len(nrow(private_composition))) {
+  r <- private_composition[i, ]
+  if (r$pct_WT > 50)
+    stop("'", r$cluster_named, "' is ", r$pct_WT, "% WT - it is not a ",
+         "DKO-specific population and one-vs-rest is indefensible.")
+  if (r$pct_WT > 2)
+    warning("'", r$cluster_named, "' is ", r$pct_WT, "% WT (", r$n_WT,
+            " cells), so it is NOT genotype-private. One-vs-rest is applied ",
+            "anyway to reproduce the 2026 methodology - caption accordingly.",
+            call. = FALSE)
+}
+message("Cluster naming verified: ", length(EXPECTED_COUNTS),
+        " clusters, counts match the archived 2026 run.")
+
+CLUSTERS_PRESENT <- intersect(CLUSTER_ORDER,
+                              as.character(unique(sc_seurat$cluster_named)))
+SHARED_CLUSTERS  <- setdiff(CLUSTERS_PRESENT, PRIVATE_CLUSTERS)
+ALL_SCOPE <- CLUSTERS_PRESENT
+PYR_SCOPE <- intersect(CLUSTER_ORDER, PYRAMID_ALL)
+
+cluster_counts <- as.data.frame.matrix(
+  table(sc_seurat$cluster_named, sc_seurat$Genotype))
+cluster_counts$cluster_named <- rownames(cluster_counts)
+save_table(cluster_counts[, c("cluster_named", WT_LAB, DKO)],
+           "cluster_cell_counts.csv")
+print(cluster_counts)
+
+message("Cells: ", ncol(sc_seurat), " | clusters: ", nlevels(sc_seurat$cluster_named),
+        " | private (DKO-only): ", paste(PRIVATE_CLUSTERS, collapse = ", "))
+```
+
+# Dimensionality-reduction plots
+
+**Sequencing depth by genotype.** Roughly twice as many mutant nuclei were recovered, so before interpreting any compositional change it is worth checking that the two libraries are of comparable quality. The tables below report, for each genotype, the number of nuclei and the mean and median number of genes and UMIs detected per nucleus, together with mitochondrial content. A second table breaks the same figures down by cluster, and a third records *Neurod2*/*Neurod6* detection in every cluster.
+
+Read it as a control: if the mutant nuclei had systematically fewer genes detected, apparent shifts in cell-type proportion could be a depth artefact rather than biology.
+
+```{r qc_depth, message=TRUE}
+qc_geno <- sc_seurat@meta.data %>%
+  group_by(Genotype) %>%
+  summarise(n_nuclei      = n(),
+            mean_genes    = round(mean(nFeature_RNA)),
+            median_genes  = round(median(nFeature_RNA)),
+            sd_genes      = round(sd(nFeature_RNA)),
+            mean_UMI      = round(mean(nCount_RNA)),
+            median_UMI    = round(median(nCount_RNA)),
+            median_pct_mt = round(median(percent.mt), 2),
+            .groups = "drop")
+print(as.data.frame(qc_geno))
+save_table(qc_geno, "QC_genes_per_nucleus_by_genotype.csv")
+
+cat("ratio of mean genes per nucleus (DKO / WT): ",
+    round(qc_geno$mean_genes[qc_geno$Genotype == DKO] /
+          qc_geno$mean_genes[qc_geno$Genotype == WT_LAB], 3), "\n", sep = "")
+
+qc_clust <- sc_seurat@meta.data %>%
+  group_by(cluster_named, Genotype) %>%
+  summarise(n = n(), median_genes = round(median(nFeature_RNA)),
+            median_UMI = round(median(nCount_RNA)), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = Genotype,
+                     values_from = c(n, median_genes, median_UMI), values_fill = 0)
+save_table(qc_clust, "QC_genes_per_nucleus_by_cluster.csv")
+
+# Neurod2/Neurod6 detection in every cluster, both genotypes - backs the
+# interneuron answer (reviewer point 2) without restricting to interneurons.
+nd_all <- intersect(c("Neurod2", "Neurod6"), rownames(sc_seurat))
+qc_nd <- FetchData(sc_seurat, vars = c(nd_all, "cluster_named", "Genotype")) %>%
+  tidyr::pivot_longer(all_of(nd_all), names_to = "gene", values_to = "expr") %>%
+  group_by(cluster_named, Genotype, gene) %>%
+  summarise(mean_expr = round(mean(expr), 3),
+            pct_expr  = round(100 * mean(expr > 0), 1), .groups = "drop")
+save_table(qc_nd, "QC_NeuroD_expression_by_cluster.csv")
+```
+
+**UMAP overviews.** Two different embeddings appear here. `umap` is computed from this dataset; `ref.umap` is the projection onto the adult mouse cortex reference used by Azimuth, so points sit where the reference thinks they belong rather than where this dataset's own variation puts them.
+
+Each plot colours the same nuclei a different way: by Azimuth predicted class or subclass, by the named cluster, or by genotype. In the panels split by genotype the two genotypes are drawn separately on shared axes — so a population present in one and absent from the other shows up as an empty region rather than as a difference in density, which is the comparison that matters here given the unequal cell recovery.
+
+```{r dimPlots}
+# Azimuth reference-UMAP views (predictions were computed during pre-processing;
+# the Azimuth package itself is not needed to plot them).
+p <- DimPlot(sc_seurat, reduction = "ref.umap", group.by = "predicted.subclass",
+             label = TRUE, pt.size = 0.1) +
+  ggtitle("Azimuth predicted subclass") + coord_fixed()
+save_plot(p, "dimplots/Azimuth_subclass_refUMAP.pdf", 8, 6)
+
+p <- DimPlot(sc_seurat, reduction = "ref.umap", group.by = "predicted.class",
+             label = TRUE, pt.size = 0.1) +
+  ggtitle("Azimuth predicted class") + coord_fixed()
+save_plot(p, "dimplots/Azimuth_class_refUMAP.pdf", 6, 5)
+
+p <- DimPlot(sc_seurat, reduction = "ref.umap", group.by = "Genotype",
+             cols = GENOTYPE_COLORS, pt.size = 0.1) +
+  ggtitle("Genotype") + coord_fixed()
+save_plot(p, "dimplots/Genotype_refUMAP.pdf", 6, 5)
+
+p <- DimPlot(sc_seurat, reduction = "ref.umap", group.by = "Genotype",
+             split.by = "Genotype", cols = GENOTYPE_COLORS, pt.size = 0.1) +
+  ggtitle("Genotype") + coord_fixed()
+save_plot(p, "dimplots/Genotype_split_refUMAP.pdf", 12, 5)
+
+# Standard UMAP views
+p <- DimPlot(sc_seurat, reduction = "umap", group.by = "predicted.class",
+             label = TRUE, pt.size = 0.1) +
+  ggtitle("Azimuth predicted class") + coord_fixed()
+save_plot(p, "dimplots/Azimuth_class_UMAP.pdf", 6, 5)
+
+p <- DimPlot(sc_seurat, reduction = "umap", group.by = "predicted.subclass",
+             label = TRUE, pt.size = 0.1) +
+  ggtitle("Azimuth predicted subclass") + coord_fixed()
+save_plot(p, "dimplots/Azimuth_subclass_UMAP.pdf", 6, 5)
+
+p <- DimPlot(sc_seurat, reduction = "umap", group.by = "predicted.subclass",
+             split.by = "Genotype", pt.size = 0.1) +
+  ggtitle("Azimuth predicted subclass") + coord_fixed()
+save_plot(p, "dimplots/Azimuth_subclass_split_UMAP.pdf", 18, 5)
+
+p <- DimPlot(sc_seurat, reduction = "umap", group.by = "seurat_clusters",
+             split.by = "Genotype", label = TRUE, pt.size = 0.1) +
+  ggtitle("res 0.5 clusters") + coord_fixed()
+save_plot(p, "dimplots/seurat_clusters_split_UMAP.pdf", 10, 6)
+
+# Named clusters. The 2026 file hardcoded a 21-colour vector here, which breaks
+# silently whenever the number of clusters changes - it is 20 now. Use Seurat's
+# default discrete palette (scales::hue_pal, exactly what DimPlot picks when no
+# cols argument is given), sized to the data and pinned to the cluster order, so
+# the named-cluster plots match the seurat_clusters plots and every figure that
+# colours by cluster - UMAPs, heatmap annotations, composition bars - agrees.
+CLUSTER_PALETTE <- setNames(scales::hue_pal()(length(CLUSTERS_PRESENT)),
+                            CLUSTERS_PRESENT)
+
+p <- DimPlot(sc_seurat, reduction = "umap", group.by = "cluster_named",
+             split.by = "Genotype", label = TRUE, pt.size = 0.1,
+             cols = CLUSTER_PALETTE) +
+  ggtitle("Named clusters (2025 clustering)") + coord_fixed() + NoLegend()
+save_plot(p, "dimplots/cluster_named_split_UMAP.pdf", 14, 8)
+
+p <- DimPlot(sc_seurat, reduction = "umap", group.by = "cluster_named",
+             label = TRUE, pt.size = 0.1, cols = CLUSTER_PALETTE) +
+  ggtitle("Named clusters (2025 clustering)") + coord_fixed()
+save_plot(p, "dimplots/cluster_named_UMAP.pdf", 9, 7)
+
+p <- DimPlot(sc_seurat, reduction = "umap", group.by = "Genotype",
+             cols = GENOTYPE_COLORS, pt.size = 0.05) +
+  coord_fixed(ratio = 1) + xlab("UMAP 1") + ylab("UMAP 2")
+save_plot(p, "dimplots/Genotype_UMAP.pdf", 20, 20, units = "cm")
+
+p <- DimPlot(sc_seurat, reduction = "umap", group.by = "Genotype",
+             split.by = "Genotype", cols = GENOTYPE_COLORS, pt.size = 0.1) +
+  coord_fixed(ratio = 1) + xlab("UMAP 1") + ylab("UMAP 2")
+save_plot(p, "dimplots/Genotype_split_UMAP.pdf", 36, 18, units = "cm")
+```
+
+# Composition is not explained by uneven cell recovery
+
+**Deep-layer composition, WT versus DKO.** A grouped bar chart of the layer clusters the reviewer asks about. The y-axis is the percentage of *that genotype's* nuclei, not a raw count, so the roughly two-fold difference in recovery cancels out by construction.
+
+The point of the figure is the direction of the bars: a uniform difference in how many nuclei were captured would move every cluster by the same factor and leave these percentages unchanged. Bars moving up for some clusters and down for others cannot be produced that way.
+
+```{r recovery_independent_composition}
+# =============================================================================
+# Reviewer point: the deep-layer expansion / L6 reduction could be an artefact of
+# recovering roughly twice as many DKO cells. Proportions are within-genotype
+# fractions, so the recovery difference is normalised out by construction. If
+# recovery were the only difference every cluster would shift by the SAME factor.
+# We show the shifts are disproportionate and go in BOTH directions, which a
+# uniform recovery bias cannot produce.
+# =============================================================================
+tot <- sc_seurat@meta.data %>% dplyr::count(Genotype, name = "total")
+tot_WT  <- tot$total[tot$Genotype == WT_LAB]
+tot_DKO <- tot$total[tot$Genotype == DKO]
+
+layer_focus <- intersect(CLUSTER_ORDER,
+                         c("Layer V", "Layer VI", "Layer VIb", PRIVATE_CLUSTERS))
+
+comp_layers <- sc_seurat@meta.data %>%
+  dplyr::filter(cluster_named %in% layer_focus) %>%
+  dplyr::count(cluster_named, Genotype, name = "n_cells") %>%
+  tidyr::pivot_wider(names_from = Genotype, values_from = n_cells, values_fill = 0) %>%
+  mutate(
+    prop_WT     = .data[[WT_LAB]] / tot_WT,
+    prop_DKO    = .data[[DKO]]    / tot_DKO,
+    pct_WT      = round(100 * prop_WT, 3),
+    pct_DKO     = round(100 * prop_DKO, 3),
+    fold_change = round(prop_DKO / (prop_WT + 1e-6), 2),
+    log2_ratio  = round(log2((prop_DKO + 1e-4) / (prop_WT + 1e-4)), 2)
+  ) %>%
+  arrange(desc(log2_ratio))
+print(comp_layers)
+save_table(comp_layers, "layer_composition_recovery_independent.csv")
+
+all_comp <- sc_seurat@meta.data %>%
+  dplyr::count(cluster_named, Genotype, name = "n_cells") %>%
+  tidyr::pivot_wider(names_from = Genotype, values_from = n_cells, values_fill = 0) %>%
+  mutate(prop_WT    = .data[[WT_LAB]] / tot_WT,
+         prop_DKO   = .data[[DKO]]    / tot_DKO,
+         log2_ratio = log2((prop_DKO + 1e-4) / (prop_WT + 1e-4)))
+
+cat("\n--- Recovery-independence check ---\n")
+cat("If uneven recovery were the sole cause, all log2 proportion-ratios would be ~0.\n")
+cat("Observed range of log2 ratios:",
+    round(min(all_comp$log2_ratio), 2), "to",
+    round(max(all_comp$log2_ratio), 2), "\n")
+cat("Clusters ENRICHED in DKO (log2 ratio > 0.5):",
+    sum(all_comp$log2_ratio > 0.5), "\n")
+cat("Clusters DEPLETED in DKO (log2 ratio < -0.5):",
+    sum(all_comp$log2_ratio < -0.5), "\n")
+cat("-> Shifts occur in BOTH directions: incompatible with uniform recovery bias.\n\n")
+
+plot_df <- comp_layers %>%
+  dplyr::select(cluster_named, pct_WT, pct_DKO) %>%
+  tidyr::pivot_longer(c(pct_WT, pct_DKO), names_to = "Genotype", values_to = "pct") %>%
+  mutate(Genotype = ifelse(Genotype == "pct_WT", "WT", "DKO"),
+         Genotype = factor(Genotype, levels = c("WT", "DKO")))
+
+p <- ggplot(plot_df, aes(x = cluster_named, y = pct, fill = Genotype)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  scale_fill_manual(values = c("WT" = "grey70", "DKO" = "firebrick")) +
+  labs(y = "% of genotype's cells (recovery-normalised)", x = NULL,
+       title = "Deep-layer composition: WT vs DKO (within-genotype proportions)",
+       subtitle = "Proportions normalise out the 2x recovery difference") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+save_plot(p, "proportions/deeplayer_recovery_independent.pdf", 7, 5)
+```
+
+# FeaturePlot helpers
+
+Defines the two helpers that write one UMAP feature plot per gene, pooled and split by genotype, parallelised across genes. No figures are produced here — they are used by later sections.
+
+```{r plot_functions}
+# Same two helpers as both source files, with the per-gene loop parallelised and
+# saving routed through save_plot(). `plotdir` is relative to PLOT_DIR.
+
+save_feature_plots <- function(seurat_obj, genes, plotdir,
+                               reduction = "ref.umap", assay = "RNA") {
+  DefaultAssay(seurat_obj) <- assay
+  genes <- intersect(genes, rownames(seurat_obj))
+  plan_fork()
+  invisible(future.apply::future_lapply(genes, function(gene) {
+    worker_setup()
+    plot <- FeaturePlot(seurat_obj, reduction = reduction, order = TRUE,
+                        features = gene, coord.fixed = TRUE, pt.size = 0.1) +
+      scale_color_gradient(low = "lightblue", high = "darkblue") +
+      xlab("UMAP 1") + ylab("UMAP 2")
+    save_plot(plot,
+              file.path(plotdir, paste0(gene, "_expression_all_", reduction, ".pdf")),
+              width = 6, height = 5, quiet = TRUE, show = FALSE)
+  }, future.seed = TRUE))
+  message("Saved ", length(genes), " FeaturePlots to ", plotdir)
+}
+
+save_feature_plots_split <- function(seurat_obj, genes, plotdir,
+                                     reduction = "ref.umap", assay = "RNA") {
+  DefaultAssay(seurat_obj) <- assay
+  genes <- intersect(genes, rownames(seurat_obj))
+  plan_fork()
+  invisible(future.apply::future_lapply(genes, function(gene) {
+    worker_setup()
+    plot <- FeaturePlot(seurat_obj, reduction = reduction, split.by = "Genotype",
+                        order = TRUE, features = gene, pt.size = 0.1,
+                        cols = c("lightblue", "darkblue"), coord.fixed = TRUE) +
+      theme(legend.position = "right",
+            legend.title = element_text(size = 10),
+            legend.text  = element_text(size = 8)) +
+      xlab("UMAP 1") + ylab("UMAP 2")
+    save_plot(plot,
+              file.path(plotdir,
+                        paste0(gene, "_expression_all_split_by_genotype_",
+                               reduction, ".pdf")),
+              width = 12, height = 5, quiet = TRUE, show = FALSE)
+  }, future.seed = TRUE))
+  message("Saved ", length(genes), " split FeaturePlots to ", plotdir)
+}
+```
+
+# Differential expression
+
+The core differential expression. For clusters containing both genotypes, a pseudobulk CPM log2 fold-change (DKO versus WT) computed within each cluster. For the DKO-specific clusters, a one-vs-rest marker contrast against all other cells, because there are essentially no wild-type cells to compare against.
+
+With one animal per genotype these are descriptive effect sizes and deliberately carry no p-values: a cell-level test would treat nuclei from a single animal as independent replicates. No figures; the output is the differential expression table used by everything that follows.
+
+```{r DEresults, message=TRUE}
+# =============================================================================
+# Between-genotype comparison - n = 1 per genotype. DESCRIPTIVE pseudobulk
+# log2FC, for ranking and visualisation only; there are no valid p-values at
+# n = 1, and a per-cell test would be pseudoreplicated.
+#
+# The Misspecified cluster has no WT cells, so a within-cluster DKO-vs-WT
+# contrast does not exist for it. It is instead compared ONE-VS-REST against all
+# other cells in the dataset - a marker-style contrast answering "what is the
+# transcriptional identity of these aberrant cells relative to the whole cortex?"
+# That same contrast is used consistently downstream (heatmaps, GSEA, ORA).
+# The Misspecified columns are therefore a DIFFERENT quantity from the shared
+# DKO-vs-WT columns and must be captioned as such.
+# =============================================================================
+
+# AggregateExpression turns "_" into "-" in group names; normalise back.
+norm_group_names <- function(x) gsub("-", "_", x)
+# AggregateExpression already hardcodes layer = "counts" internally (passing it
+# explicitly is an "argument matched by multiple actual arguments" error), so
+# these calls sum raw counts, which is what the pseudobulk CPM needs.
+
+#' Pseudobulk CPM log2FC, DKO vs WT, within one cell grouping.
+#' group_label = NULL pools all cells.
+pseudobulk_log2fc <- function(seurat_obj, group_label, group_col = "cluster_named",
+                              min_cells = 20, pseudocount = 1) {
+  label <- if (is.null(group_label)) "ALL" else as.character(group_label)
+  sub <- if (is.null(group_label)) seurat_obj else
+    seurat_obj[, as.character(seurat_obj@meta.data[[group_col]]) == group_label]
+
+  n_per <- table(factor(as.character(sub$Genotype), levels = c(WT_LAB, DKO)))
+  if (any(n_per[c(WT_LAB, DKO)] < min_cells)) {
+    message("  log2FC skip '", label, "' (<", min_cells, " cells in a genotype)")
+    return(NULL)
+  }
+
+  agg <- AggregateExpression(sub, assays = "RNA",
+                             group.by = "Genotype",
+                             return.seurat = FALSE, verbose = FALSE)$RNA
+  agg <- as.matrix(agg)
+  colnames(agg) <- norm_group_names(colnames(agg))
+  if (!all(c(WT_LAB, DKO) %in% colnames(agg))) return(NULL)
+
+  cpm <- sweep(agg, 2, colSums(agg), "/") * 1e6
+  data.frame(
+    gene       = rownames(cpm),
+    cpm_WT     = cpm[, WT_LAB],
+    cpm_DKO    = cpm[, DKO],
+    n_WT       = as.integer(n_per[WT_LAB]),
+    n_DKO      = as.integer(n_per[DKO]),
+    avg_log2FC = log2((cpm[, DKO] + pseudocount) / (cpm[, WT_LAB] + pseudocount)),
+    mean_cpm   = (cpm[, DKO] + cpm[, WT_LAB]) / 2,
+    row.names  = NULL,
+    check.names = FALSE
+  )
+}
+
+#' Pseudobulk CPM log2FC, one genotype-private cluster vs ALL OTHER cells.
+#' Returns the same column shape as pseudobulk_log2fc(): the `cpm_WT` slot holds
+#' the "Rest" reference, `cpm_DKO` holds the private cluster.
+misspec_vs_rest <- function(seurat_obj, misspec_cluster,
+                            min_cells = 20, pseudocount = 1) {
+  grp <- ifelse(as.character(seurat_obj$cluster_named) == misspec_cluster,
+                "Misspecified", "Rest")
+  n_misspec <- sum(grp == "Misspecified")
+  n_rest    <- sum(grp == "Rest")
+  if (n_misspec < min_cells || n_rest < min_cells) {
+    message("  Misspec(vs-rest) skip '", misspec_cluster, "' (",
+            n_misspec, " misspec / ", n_rest, " rest cells)")
+    return(NULL)
+  }
+
+  sub <- seurat_obj
+  sub$compare_grp <- grp
+  agg <- AggregateExpression(sub, assays = "RNA",
+                             group.by = "compare_grp",
+                             return.seurat = FALSE, verbose = FALSE)$RNA
+  agg <- as.matrix(agg)
+  if (!all(c("Misspecified", "Rest") %in% colnames(agg))) return(NULL)
+
+  cpm <- sweep(agg, 2, colSums(agg), "/") * 1e6
+  data.frame(
+    gene       = rownames(cpm),
+    cpm_WT     = cpm[, "Rest"],          # reference = all other cells
+    cpm_DKO    = cpm[, "Misspecified"],
+    n_WT       = as.integer(n_rest),
+    n_DKO      = as.integer(n_misspec),
+    avg_log2FC = log2((cpm[, "Misspecified"] + pseudocount) /
+                        (cpm[, "Rest"] + pseudocount)),
+    mean_cpm   = (cpm[, "Misspecified"] + cpm[, "Rest"]) / 2,
+    cluster_named = misspec_cluster,
+    comparison = "Misspec_vs_Rest",
+    row.names  = NULL,
+    check.names = FALSE
+  )
+}
+
+# ---- All cells pooled ----
+DE <- pseudobulk_log2fc(sc_seurat, group_label = NULL)
+save_table(DE, "Differential_genes_All_cells_DKO_vs_WT.csv")
+
+# ---- Per shared cluster, in parallel ----
+plan_fork()
+DE_results <- future.apply::future_lapply(SHARED_CLUSTERS, function(cl) {
+  worker_setup()
+  res <- pseudobulk_log2fc(sc_seurat, group_label = cl)
+  if (!is.null(res)) res$cluster_named <- cl
+  res
+}, future.seed = TRUE)
+names(DE_results) <- SHARED_CLUSTERS
+
+DE_combined <- DE_results %>% purrr::compact() %>% dplyr::bind_rows()
+DE_combined$comparison <- "DKO_vs_WT"
+
+# ---- Genotype-private cluster(s) via one-vs-rest ----
+private_rows <- purrr::map(PRIVATE_CLUSTERS, ~ misspec_vs_rest(sc_seurat, .x)) %>%
+  purrr::compact() %>% dplyr::bind_rows()
+
+DE_combined_all <- bind_rows(DE_combined, private_rows)
+DE_combined_all$cluster_named <- factor(DE_combined_all$cluster_named,
+                                        levels = CLUSTER_ORDER)
+save_table(DE_combined_all, "Genotype_changes_DKO_vs_WT_ALL_clusters.csv")
+
+DE_combined_pyramids <- DE_combined_all %>%
+  dplyr::filter(cluster_named %in% PYR_SCOPE)
+save_table(DE_combined_pyramids, "Genotype_changes_DKO_vs_WT_pyramids_ALL.csv")
+
+print(DE_combined_all %>% count(comparison, cluster_named) %>% as.data.frame())
+```
+
+# Heatmaps
+
+Selects the genes for the heatmaps. A gene qualifies on fold-change, an expression floor, and a within-cluster detection-rate guard — the last of these asks whether the genotype difference also shows up as a change in the *fraction* of nuclei expressing the gene, not just in the average.
+
+The printed counts report how many genes came from the shared DKO-vs-WT contrast versus the one-vs-rest contrast; a shared count of zero would mean the cutoffs are unsatisfiable and the heatmap is showing marker genes only.
+
+```{r heatmap, fig.width=10, fig.height=12, message=TRUE}
+# =============================================================================
+# Genes are selected per scope. Shared-cluster rows are gated by DKO-vs-WT
+# pseudobulk log2FC + CPM floor + a cell-level detection-specificity guard;
+# Misspecified rows are gated by their ONE-VS-REST log2FC + CPM floor.
+# The Misspecified columns are marker-style, a different quantity from the shared
+# DKO-vs-WT columns - caption accordingly.
+# =============================================================================
+
+# =============================================================================
+# Cell-level detection guard: the fraction of cells in which a gene is detected,
+# per genotype, WITHIN EACH SHARED CLUSTER.
+#
+# The 2026 file pooled this across all cells, then required
+# |pct_DKO - pct_WT| > 0.3. Pooling averages a cluster-specific detection
+# difference over the whole dataset and destroys it: the largest pooled
+# difference for ANY gene in this data is 0.2115, so the gate admitted ZERO
+# genes and every shared-cluster gene was silently dropped from the heatmaps.
+# (Both this analysis and the 2026 run were left with only the one-vs-rest
+# Misspecified genes plus FORCE_GENES.)
+#
+# The DE contrast is within-cluster, so the guard must be too. Computed per
+# cluster, the same 0.3 threshold admits 132 genes, which is the intended
+# behaviour: keep genes whose genotype effect shows up as a detection shift,
+# not just a CPM ratio driven by a handful of cells.
+# =============================================================================
+expr_bin  <- GetAssayData(sc_seurat, layer = "counts") > 0
+cl_vec    <- as.character(sc_seurat$cluster_named)
+geno_vec  <- as.character(sc_seurat$Genotype)
+
+detect_df <- purrr::map_dfr(SHARED_CLUSTERS, function(k) {
+  iW <- which(cl_vec == k & geno_vec == WT_LAB)
+  iD <- which(cl_vec == k & geno_vec == DKO)
+  if (length(iW) < 20 || length(iD) < 20) return(NULL)
+  data.frame(gene          = rownames(sc_seurat),
+             cluster_named = k,
+             pct_WT        = Matrix::rowMeans(expr_bin[, iW, drop = FALSE]),
+             pct_DKO       = Matrix::rowMeans(expr_bin[, iD, drop = FALSE]),
+             row.names     = NULL)
+}) %>% mutate(specificity = pct_DKO - pct_WT)
+
+rm(expr_bin, cl_vec, geno_vec); invisible(gc(verbose = FALSE))
+message("Detection guard: ", nrow(detect_df), " gene x cluster rows | ",
+        "max |specificity| = ", round(max(abs(detect_df$specificity)), 3))
+
+# Minimum cells PER GENOTYPE for a cluster to contribute genes to the selection.
+# The pseudobulk itself is computed at >=20 cells, but a CPM from 24 cells is far
+# too unstable to choose heatmap genes from: at 20, the Oligodendrocyte cluster
+# (24 DKO / 36 WT) alone contributed 90 of 132 shared genes, with Endothelial and
+# Microglia adding 23 more - i.e. two thirds of the shared half of the figure
+# came from clusters under 70 cells. Every cluster is still DISPLAYED as a
+# column; this only governs which clusters get to drive gene choice.
+SELECT_MIN_CELLS <- 100
+
+select_top_genes <- function(de_table, scope_clusters,
+                             shared_fc, shared_cpm, shared_spec,
+                             private_fc, private_cpm) {
+  # Joined on gene AND cluster: the detection guard is per cluster, matching the
+  # per-cluster DE contrast. Private clusters have no WT cells and so no
+  # detect_df rows; their specificity is NA, which is fine because the private
+  # branch below does not use it.
+  tbl <- de_table %>%
+    dplyr::filter(cluster_named %in% scope_clusters) %>%
+    dplyr::mutate(cluster_named = as.character(cluster_named)) %>%
+    dplyr::left_join(detect_df, by = c("gene", "cluster_named"))
+
+  shared_hits <- tbl %>%
+    dplyr::filter(comparison == "DKO_vs_WT",
+                  n_WT >= SELECT_MIN_CELLS, n_DKO >= SELECT_MIN_CELLS,
+                  abs(avg_log2FC)  > shared_fc,
+                  mean_cpm         > shared_cpm,
+                  abs(specificity) > shared_spec) %>%
+    dplyr::pull(gene)
+
+  private_hits <- tbl %>%
+    dplyr::filter(comparison == "Misspec_vs_Rest",
+                  abs(avg_log2FC) > private_fc,
+                  mean_cpm        > private_cpm) %>%
+    dplyr::pull(gene)
+
+  # Report the split. A shared count of 0 means the gates are unsatisfiable and
+  # the heatmap is silently showing only one-vs-rest marker genes - which is
+  # exactly what happened in the 2026 file.
+  message("  select_top_genes: ", length(unique(shared_hits)), " shared + ",
+          length(unique(private_hits)), " one-vs-rest genes (",
+          length(scope_clusters), " clusters in scope)")
+  if (!length(shared_hits))
+    warning("No shared-cluster genes passed the selection gates - check ",
+            "shared_fc / shared_cpm / shared_spec", call. = FALSE)
+
+  unique(c(shared_hits, private_hits, intersect(FORCE_GENES, de_table$gene)))
+}
+
+# shared_spec is 0.3 for both the permissive and the strict selection. The 2026
+# file used 0.5 for the strict one, but even with the corrected per-cluster
+# guard no gene reaches 0.5 alongside |log2FC| > 2.5 and CPM > 20 (0 genes at
+# 0.5, 8 at 0.4, 40 at 0.3) - the strictness there comes from the log2FC and CPM
+# cutoffs, not the detection shift.
+genes_all_cell <- select_top_genes(DE_combined_all, ALL_SCOPE,
+                                   shared_fc = 1.5, shared_cpm = 15, shared_spec = 0.3,
+                                   private_fc = 2,   private_cpm = 15)
+genes_all_fc   <- select_top_genes(DE_combined_all, ALL_SCOPE,
+                                   shared_fc = 2.5, shared_cpm = 20, shared_spec = 0.3,
+                                   private_fc = 3,   private_cpm = 20)
+genes_pyr_cell <- select_top_genes(DE_combined_all, PYR_SCOPE,
+                                   shared_fc = 1.5, shared_cpm = 15, shared_spec = 0.3,
+                                   private_fc = 2,   private_cpm = 15)
+genes_pyr_fc   <- select_top_genes(DE_combined_all, PYR_SCOPE,
+                                   shared_fc = 2.5, shared_cpm = 20, shared_spec = 0.3,
+                                   private_fc = 3,   private_cpm = 20)
+
+message("ALL-clusters  - cell: ", length(genes_all_cell),
+        " genes | logFC: ", length(genes_all_fc), " genes")
+message("Pyramidal     - cell: ", length(genes_pyr_cell),
+        " genes | logFC: ", length(genes_pyr_fc), " genes")
+
+#' Cell-level scaled-expression heatmap, cells ordered by cluster then genotype.
+render_cell_heatmap <- function(genes, scope_clusters, file, title,
+                                width = 8, height = 10, label_every = NULL) {
+  sub <- cells_in_clusters(sc_seurat, scope_clusters)
+  sub$cluster_named <- factor(as.character(sub$cluster_named), levels = scope_clusters)
+  DefaultAssay(sub) <- "RNA"
+  sub <- ScaleData(sub, features = genes, verbose = FALSE)
+
+  mat <- GetAssayData(sub, layer = "scale.data")
+  mat <- mat[intersect(rownames(mat), genes), , drop = FALSE]
+
+  ann <- sub@meta.data[colnames(mat), c("cluster_named", "Genotype")]
+  ann$Genotype      <- factor(as.character(ann$Genotype), levels = c(WT_LAB, DKO))
+  ann$cluster_named <- factor(as.character(ann$cluster_named), levels = scope_clusters)
+  ord <- order(ann$cluster_named, ann$Genotype)
+  mat <- mat[, ord, drop = FALSE]
+  ann <- ann[ord, ]
+
+  col_ann <- HeatmapAnnotation(
+    Genotype = ann$Genotype, Celltype = ann$cluster_named,
+    col = list(Genotype = GENOTYPE_COLORS,
+               Celltype = CLUSTER_PALETTE[levels(ann$cluster_named)]))
+
+  curated_idx <- which(rownames(mat) %in% LABEL_GENES)
+  mark_idx <- if (!is.null(label_every) && label_every > 0) {
+    sort(unique(c(seq(1, nrow(mat), by = label_every), curated_idx)))
+  } else sort(curated_idx)
+
+  gene_labels <- rowAnnotation(
+    Genes = anno_mark(at = mark_idx, labels = rownames(mat)[mark_idx],
+                      labels_gp = gpar(fontsize = 9, fontface = "italic"),
+                      padding = 0.5))
+
+  h <- Heatmap(mat, name = "Scaled Expression", top_annotation = col_ann,
+               show_row_names = FALSE, show_column_names = FALSE,
+               cluster_rows = TRUE, column_split = ann$cluster_named,
+               cluster_columns = FALSE, column_title = wrap_title(title, width),
+               row_title = "Top Genes",
+               row_gap = unit(0.5, "mm"), column_gap = unit(0.5, "mm"),
+               clustering_method_rows = "ward.D2", use_raster = TRUE,
+               raster_device = RASTER_BACKEND$device,
+               raster_device_param = RASTER_BACKEND$param,
+               col = colorRamp2(c(-2, 0, 2), c("blue", "white", "red")),
+               heatmap_legend_param = list(title = "Scaled Expression"))
+
+  save_pdf(file, width, height, ComplexHeatmap::draw(h + gene_labels))
+  message("  ", nrow(mat), " genes, ", length(mark_idx), " labelled")
+}
+
+#' Wrap a heatmap title so long captions are not clipped.
+#'
+#' The title is centred over the heatmap BODY, not the page, so the usable width
+#' is the figure width minus whatever the row-name column and the legends take
+#' (`reserve`). At ~12 characters per inch for the 11pt bold title, wrapping to
+#' the full page width still overflows on the left.
+wrap_title <- function(x, width_in, reserve = 2.2) {
+  paste(strwrap(x, width = max(18, floor((width_in - reserve) * 12))),
+        collapse = "\n")
+}
+
+#' Symmetric colour ramp, capped at a quantile of |value| so a few extreme cells
+#' cannot flatten the rest of the map. Values beyond the cap saturate.
+symmetric_ramp <- function(x, q = 0.98, min_cap = 0.5) {
+  x <- x[is.finite(x)]
+  cap <- max(stats::quantile(abs(x), q, na.rm = TRUE), min_cap)
+  list(fun = colorRamp2(c(-cap, 0, cap), c("blue", "white", "red")), cap = cap)
+}
+
+#' Pseudobulk log2FC heatmap: one column per cluster.
+#'
+#' The shared columns are a within-cluster DKO-vs-WT contrast; the Misspecified
+#' column is a one-vs-rest marker contrast. Those are DIFFERENT QUANTITIES and
+#' the one-vs-rest values are much larger, so putting them on a single colour
+#' scale lets the Misspecified column set the range and washes the shared columns
+#' out to near-white. They are therefore drawn as two adjacent panels, each with
+#' its own symmetric, quantile-capped scale and its own legend. Row order comes
+#' from clustering the shared panel, so the rows still line up across both.
+render_logfc_heatmap <- function(genes, scope_clusters, file, title,
+                                 width = 6, height = 10, cap_quantile = 0.98) {
+  wide <- function(tbl) {
+    if (!nrow(tbl)) return(NULL)
+    m <- tbl %>%
+      dplyr::select(gene, cluster = cluster_named, value = avg_log2FC) %>%
+      dplyr::mutate(cluster = as.character(cluster)) %>%
+      tidyr::pivot_wider(names_from = cluster, values_from = value) %>%
+      tibble::column_to_rownames("gene") %>%
+      as.matrix()
+    m[is.na(m)] <- 0
+    m
+  }
+
+  tbl <- DE_combined_all %>%
+    dplyr::filter(gene %in% genes, cluster_named %in% scope_clusters)
+  shared_cols  <- intersect(setdiff(scope_clusters, PRIVATE_CLUSTERS),
+                            as.character(unique(tbl$cluster_named)))
+  private_cols <- intersect(PRIVATE_CLUSTERS, as.character(unique(tbl$cluster_named)))
+
+  mat_shared <- wide(tbl %>% dplyr::filter(cluster_named %in% shared_cols))
+  if (is.null(mat_shared)) { message("  no shared columns to plot"); return(invisible(NULL)) }
+  mat_shared <- mat_shared[, shared_cols, drop = FALSE]
+
+  ramp_shared <- symmetric_ramp(as.vector(mat_shared), cap_quantile)
+  lab <- function(cap) c(paste0("<= -", round(cap, 2)), "0", paste0(">= ", round(cap, 2)))
+
+  # Final figure width, needed before the title is wrapped.
+  total_width <- width + 0.6 * length(private_cols)
+
+  # Gene names sit on the RIGHT of the whole figure. ComplexHeatmap silently
+  # drops right-side row names from any panel that has another panel appended to
+  # it, so they cannot be drawn here when a private panel follows - they are put
+  # on the last panel instead (below). With no private panel this one is last, so
+  # it carries them itself.
+  h <- Heatmap(
+    mat_shared, name = "log2FC\nDKO vs WT", col = ramp_shared$fun,
+    cluster_rows = TRUE, cluster_columns = FALSE,
+    show_row_names = !length(private_cols), row_names_side = "right",
+    row_names_gp = gpar(fontsize = 9), column_names_gp = gpar(fontsize = 10),
+    heatmap_legend_param = list(
+      title = "log2FC\nDKO vs WT",
+      at = c(-ramp_shared$cap, 0, ramp_shared$cap),
+      labels = lab(ramp_shared$cap)),
+    column_title = wrap_title(title, total_width),
+    column_title_gp = gpar(fontsize = 11, fontface = "bold"))
+
+  # The private cluster(s) get their own panel and their own scale: a one-vs-rest
+  # marker log2FC is not comparable to the within-cluster genotype log2FC.
+  if (length(private_cols)) {
+    mat_private <- wide(tbl %>% dplyr::filter(cluster_named %in% private_cols))
+    mat_private <- mat_private[rownames(mat_shared), private_cols, drop = FALSE]
+    ramp_private <- symmetric_ramp(as.vector(mat_private), cap_quantile)
+    h <- h + Heatmap(
+      mat_private, name = "log2FC\nvs rest", col = ramp_private$fun,
+      cluster_rows = FALSE, cluster_columns = FALSE,
+      show_row_names = TRUE, row_names_side = "right",
+      row_names_gp = gpar(fontsize = 9), column_names_gp = gpar(fontsize = 10),
+      heatmap_legend_param = list(
+        title = "log2FC\nvs rest",
+        at = c(-ramp_private$cap, 0, ramp_private$cap),
+        labels = lab(ramp_private$cap)))
+    message("  shared cap +/-", round(ramp_shared$cap, 2),
+            " | vs-rest cap +/-", round(ramp_private$cap, 2))
+  }
+
+  save_pdf(file, total_width, height, ComplexHeatmap::draw(h, merge_legend = TRUE))
+  message("  ", nrow(mat_shared), " genes")
+}
+
+```
+
+**Cell-level expression heatmap, all clusters.** Every column is one nucleus, ordered by cluster and then by genotype; every row is one gene. Colour is expression z-scored across nuclei — blue below the gene's mean, red above, so the comparison is within a row and not between rows.
+
+The two annotation bars along the top give genotype and cluster identity. With ~39,000 columns the body is rasterised, and only a curated subset of genes is labelled, otherwise the row names would be unreadable. Read it for block structure: a band of red confined to one cluster's columns is a gene specific to that population.
+
+```{r heatmap_cell_all, fig.width=11, fig.height=12, message=TRUE}
+render_cell_heatmap(
+  genes_all_cell, ALL_SCOPE,
+  file  = "heatmaps/heatmap_cell_ALL_clusters.pdf",
+  title = "Genotype-related expression by celltype - all clusters (Misspecified = vs rest)",
+  width = 11, height = 12, label_every = 4)
+
+```
+
+**Fold-change summary by cluster, all clusters.** A compact version of the previous figure: one column per cluster rather than per nucleus, one row per gene, colour is the pseudobulk log2 fold-change.
+
+Note the figure has **two panels with separate colour scales**. The wide left panel is the within-cluster DKO-vs-WT contrast. The narrow right panel is the misspecified clusters, where no wild-type cells exist and the contrast is instead one-vs-rest against all other nuclei — a different quantity with a much wider range, so forcing it onto a shared scale would flatten the left panel to near-white. Each scale is symmetric about zero and capped at the 98th percentile of its own values, so a handful of extreme genes cannot wash out the rest; values beyond the cap saturate.
+
+```{r heatmap_logfc_all, fig.width=7.2, fig.height=12, message=TRUE}
+render_logfc_heatmap(
+  genes_all_fc, ALL_SCOPE,
+  file  = "heatmaps/heatmap_avglog2FC_ALL_clusters.pdf",
+  title = "log2FC by celltype - all clusters (shared = DKO-vs-WT; Misspecified = vs rest)",
+  width = 6, height = 12)
+
+```
+
+**Cell-level expression heatmap, pyramidal lineage only.** As above, but restricted to the pyramidal clusters and the DKO-specific clusters, with a gene set selected for that narrower scope. Useful when the glial and interneuron columns of the all-cluster version dominate the picture.
+
+```{r heatmap_cell_pyr, fig.width=8, fig.height=10, message=TRUE}
+render_cell_heatmap(
+  genes_pyr_cell, PYR_SCOPE,
+  file  = "heatmaps/heatmap_cell_pyramids.pdf",
+  title = "Genotype-related expression by celltype - pyramidal + Misspecified (Misspecified = vs rest)",
+  width = 8, height = 10, label_every = 6)
+
+```
+
+**Fold-change summary by cluster, pyramidal lineage only.** The narrow-scope counterpart of the all-cluster fold-change map, with the same two-panel construction and independent colour scales.
+
+```{r heatmap_logfc_pyr, fig.width=5.7, fig.height=12, message=TRUE}
+render_logfc_heatmap(
+  genes_pyr_fc, PYR_SCOPE,
+  file  = "heatmaps/heatmap_avglog2FC_pyramids.pdf",
+  title = "log2FC - pyramidal + Misspecified (shared = DKO-vs-WT; Misspecified = vs rest)",
+  width = 4.5, height = 12)
+```
+
+# GSEA
+
+Builds the ranked gene lists that GSEA consumes, using per-cell fold-changes, which are continuous and therefore effectively free of ties. The printed percentages report how tied each ranking is — a heavily tied ranking would make the enrichment statistic unreliable. No figures.
+
+```{r gsea_ranks}
+# =============================================================================
+# GSEA is ranked on PER-CELL FindMarkers log2FC, which is continuous and so
+# effectively tie-free. (The p-values from that call are not used - only the
+# ordering.)
+#   Shared clusters   : FindMarkers(DKO vs WT) within the cluster
+#   Misspecified      : FindMarkers(cluster vs ALL OTHER cells) - one-vs-rest,
+#                       consistent with the heatmap and DE contrasts
+# Scope: neuronal clusters (pyramidal lineage + interneurons), plus a pooled
+# all-cells ranking.
+#
+# Ranking is split from gseGO() so that only this stage needs the Seurat object:
+# it forks, while the GO stage uses fresh sessions (AnnotationDbi + fork is not
+# safe).
+# =============================================================================
+MIN_CELLS_GSEA <- 3
+
+GSEA_CLUSTERS <- intersect(NEURONAL_CLUSTERS, CLUSTERS_PRESENT)
+RANK_TARGETS  <- c(GSEA_CLUSTERS, "all")
+message("GSEA targets: ", paste(RANK_TARGETS, collapse = ", "))
+
+markers_to_ranks <- function(df) {
+  df %>%
+    tibble::rownames_to_column("gene") %>%
+    dplyr::select(gene, avg_log2FC) %>%
+    dplyr::filter(!is.na(avg_log2FC)) %>%
+    dplyr::arrange(desc(avg_log2FC)) %>%
+    tibble::deframe()
+}
+
+#' Shared cluster: per-cell DKO vs WT within the cluster.
+ranks_dko_vs_wt <- function(seurat_obj, clust) {
+  sub <- cells_in_clusters(seurat_obj, clust)
+  Idents(sub) <- "Genotype"
+  cc <- table(factor(as.character(Idents(sub)), levels = c(WT_LAB, DKO)))
+  if (any(cc[c(DKO, WT_LAB)] < MIN_CELLS_GSEA)) {
+    message("  GSEA skip '", clust, "' (insufficient cells per genotype)")
+    return(numeric(0))
+  }
+  markers_to_ranks(FindMarkers(sub, ident.1 = DKO, ident.2 = WT_LAB,
+                               logfc.threshold = 0, min.pct = 0, verbose = FALSE))
+}
+
+#' Genotype-private cluster: per-cell cluster vs ALL OTHER cells.
+ranks_misspec <- function(seurat_obj, misspec_cluster) {
+  if (sum(seurat_obj$cluster_named == misspec_cluster) < MIN_CELLS_GSEA) {
+    message("  GSEA skip '", misspec_cluster, "' (too few cells)")
+    return(numeric(0))
+  }
+  Idents(seurat_obj) <- "cluster_named"
+  markers_to_ranks(FindMarkers(seurat_obj, ident.1 = misspec_cluster, ident.2 = NULL,
+                               logfc.threshold = 0, min.pct = 0, verbose = FALSE))
+}
+
+#' Pooled: per-cell DKO vs WT across every cell.
+ranks_all_cells <- function(seurat_obj) {
+  Idents(seurat_obj) <- "Genotype"
+  markers_to_ranks(FindMarkers(seurat_obj, ident.1 = DKO, ident.2 = WT_LAB,
+                               logfc.threshold = 0, min.pct = 0, verbose = FALSE))
+}
+
+plan_fork()
+rank_list <- future.apply::future_lapply(RANK_TARGETS, function(target) {
+  worker_setup()
+  if (target == "all")                    ranks_all_cells(sc_seurat)
+  else if (target %in% PRIVATE_CLUSTERS)  ranks_misspec(sc_seurat, target)
+  else                                    ranks_dko_vs_wt(sc_seurat, target)
+}, future.seed = TRUE)
+names(rank_list) <- RANK_TARGETS
+
+tie_frac <- function(x) if (!length(x)) NA_real_ else
+  mean(duplicated(x) | duplicated(x, fromLast = TRUE))
+
+rank_list <- rank_list[vapply(rank_list, length, integer(1)) >= 50]
+for (nm in names(rank_list)) {
+  message(sprintf("ranks '%s': %d genes, %.1f%% tied",
+                  nm, length(rank_list[[nm]]), 100 * tie_frac(rank_list[[nm]])))
+}
+```
+
+Runs GO biological-process gene-set enrichment on those rankings, one cluster per worker. No figures; the per-cluster result tables are written to `tables/GSEA/`.
+
+```{r gsea_run}
+# gseGO on the ranked lists. clusterProfiler 4.20 replaced the 2026 file's
+# nPermSimple/eps arguments with nPerm + method = "multilevel"; multilevel is the
+# fgsea estimator that resolves very small p-values, which is what eps = 0 was
+# doing before. gseGO no longer forwards ... to the fgsea layer, so eps cannot be
+# set from here and p-values floor at 1e-10 - irrelevant for ranking terms and
+# for the -log10(FDR) point sizes, which is all these results are used for.
+# fgsea reports a handful of pathways with NA p-values (unbalanced statistics);
+# every downstream step filters on !is.na(p.adjust).
+#
+# Runs in fresh sessions (not forks) because org.Mm.eg.db is SQLite-backed, and
+# OrgDb is passed as a STRING so no database connection is serialised. Inputs are
+# just the ranked vectors, so the export cost is negligible.
+plan_session()
+
+gsea_raw <- future.apply::future_lapply(names(rank_list), function(nm) {
+  worker_setup()
+  ranks <- rank_list[[nm]]
+  tryCatch(
+    clusterProfiler::gseGO(geneList = ranks, OrgDb = "org.Mm.eg.db", ont = "BP",
+                           keyType = "SYMBOL", nPerm = 10000,
+                           method = "multilevel", verbose = FALSE),
+    error = function(e) { message("  GSEA error '", nm, "': ", e$message); NULL })
+}, future.seed = TRUE)
+names(gsea_raw) <- names(rank_list)
+
+gsea_results <- purrr::compact(gsea_raw)
+# One line rather than a per-file log; the tables are listed in tables/GSEA/.
+cat("GSEA completed for", length(gsea_results), "gene sets:\n  ",
+    paste(names(gsea_results), collapse = ", "), "\n")
+
+#' Result table of a gseaResult, or the object itself if already a data frame.
+get_gsea_df <- function(x) {
+  if (is.null(x)) return(NULL)
+  if (isS4(x) && "result" %in% methods::slotNames(x)) return(as.data.frame(x@result))
+  as.data.frame(x)
+}
+
+for (nm in names(gsea_results)) {
+  df <- get_gsea_df(gsea_results[[nm]])
+  if (!is.null(df) && nrow(df) > 0) {
+    save_table(df %>% dplyr::select(dplyr::any_of(
+                 c("ID", "Description", "setSize", "NES", "pvalue",
+                   "p.adjust", "qvalue", "core_enrichment"))),
+               file.path("GSEA", paste0("GSEA_terms_", safe_name(nm), ".csv")))
+  }
+}
+```
+
+**GSEA summary figures.** Two kinds.
+
+The **dot plot** summarises the strongest terms across clusters: x-axis cluster, y-axis GO term, point size is −log10(FDR) so larger means more significant, and colour is the normalised enrichment score — red for terms enriched toward the top of that cluster's ranking, blue for the bottom. Terms appearing in several clusters are ordered to sit together.
+
+The **per-term tile plots** then open a single term up: x-axis is the genes driving its enrichment (the core enrichment set), y-axis is cluster, and colour is the pseudobulk log2 fold-change of that gene in that cluster. One caveat worth knowing when reading these: the colour is the *display* metric (pseudobulk), which is not the same quantity GSEA was *ranked* on (per-cell fold-change). They are consistent in direction but not identical in magnitude.
+
+```{r plotGSEA, fig.width=9, fig.height=11}
+# =============================================================================
+# GSEA summary figures, per scope. Scopes follow the GSEA scope (which clusters
+# actually produced results), not the heatmap scope.
+#
+# Tileplot DISPLAY metric = pseudobulk log2FC from DE_combined_all (shared =
+# DKO-vs-WT; Misspecified = one-vs-rest). This intentionally differs from the
+# GSEA RANKING metric (per-cell FindMarkers): ranking needs a continuous tie-free
+# score, display needs consistency with the heatmaps.
+# =============================================================================
+scope_clusters <- list(
+  ALL_NEURONAL = intersect(c(GSEA_CLUSTERS, "all"), names(gsea_results)),
+  PYRAMIDS     = intersect(c(PYRAMID_ALL, "all"),   names(gsea_results))
+)
+
+#' Pseudobulk log2FC for a gene set across clusters, with the pooled "all" column.
+logfc_for_genes <- function(de_table, genes, clusters, all_cells_DE) {
+  out <- de_table %>%
+    dplyr::filter(gene %in% genes,
+                  as.character(cluster_named) %in% setdiff(clusters, "all")) %>%
+    dplyr::select(gene, avg_log2FC, cluster = cluster_named) %>%
+    dplyr::mutate(cluster = as.character(cluster))
+  if ("all" %in% clusters && !is.null(all_cells_DE)) {
+    out <- dplyr::bind_rows(out, all_cells_DE %>%
+      dplyr::filter(gene %in% genes) %>%
+      dplyr::select(gene, avg_log2FC) %>%
+      dplyr::mutate(cluster = "all"))
+  }
+  out
+}
+
+# Tileplot gene-count bounds. MIN keeps degenerate 2-3 column plots from being
+# written at all; MAX keeps very broad terms readable.
+MIN_TILE_GENES <- 4
+MAX_TILE_GENES <- 50
+
+#' Genes backing each term, POOLED ACROSS EVERY CLUSTER in the result list.
+#'
+#' The 2026 version walked the clusters and returned the first one that carried
+#' the term, so a tileplot showed only that single cluster's gene list. For ORA
+#' that is typically 1-3 genes (a ~150-gene query against a GO term overlaps in
+#' just a handful), which is why most Genes_by_cluster plots came out 2-3 columns
+#' wide. A term's plot should show every gene implicated in ANY cluster in scope,
+#' so the lists are unioned: median genes per ORA term goes from 1 to 13, and per
+#' GSEA term from 15 to 23.
+collect_term_genes <- function(results_list, terms, gene_col, to_df = identity) {
+  purrr::map_dfr(terms, function(term) {
+    genes <- unique(unlist(lapply(results_list, function(obj) {
+      df <- to_df(obj)
+      if (is.null(df) || !all(c("Description", gene_col) %in% colnames(df)))
+        return(character(0))
+      row <- df[df$Description == term, , drop = FALSE]
+      if (!nrow(row)) return(character(0))
+      val <- row[[gene_col]][1]
+      if (is.na(val) || !nzchar(val)) return(character(0))
+      strsplit(val, "/")[[1]]
+    })))
+    if (!length(genes)) return(NULL)
+    tibble::tibble(Description = term, gene = genes)
+  })
+}
+
+#' One gene-by-cluster tileplot per GO term.
+render_term_tileplots <- function(term_logfc_data, term_to_clusters, out_subdir,
+                                  tile_size = 0.3) {
+  terms <- unique(term_logfc_data$Description)
+  plan_fork()
+  n_written <- future.apply::future_lapply(terms, function(term) {
+    worker_setup()
+    plot_df <- term_logfc_data %>% dplyr::filter(Description == term)
+
+    # Rank genes by mean |log2FC| and keep the strongest MAX_TILE_GENES so broad
+    # terms stay legible.
+    gene_order <- plot_df %>% dplyr::group_by(gene) %>%
+      dplyr::summarise(score = mean(abs(avg_log2FC), na.rm = TRUE), .groups = "drop") %>%
+      dplyr::arrange(desc(score)) %>% dplyr::pull(gene)
+    gene_order <- utils::head(gene_order, MAX_TILE_GENES)
+
+    plot_df <- plot_df %>%
+      dplyr::filter(gene %in% gene_order) %>%
+      dplyr::mutate(cluster = factor(cluster, levels = sort(unique(cluster))),
+                    gene    = factor(gene, levels = gene_order))
+
+    n_genes    <- length(unique(plot_df$gene))
+    n_clusters <- length(unique(plot_df$cluster))
+    if (n_genes < MIN_TILE_GENES || n_clusters < 2) return(0L)
+
+    note <- term_to_clusters$clusters[term_to_clusters$Description == term]
+    if (!length(note)) note <- "Unknown"
+
+    p <- ggplot(plot_df, aes(x = gene, y = cluster, fill = avg_log2FC)) +
+      geom_tile(color = "white") +
+      scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+      theme_minimal(base_size = 11) +
+      labs(title = paste0("GO:BP ", term, "\n(Enriched in: ", note, ")"),
+           x = "Gene", y = "Cluster", fill = "avg log2FC") +
+      theme(axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+            axis.text.y = element_text(size = 12),
+            plot.title  = element_text(size = 12, face = "bold"),
+            plot.margin = margin(10, 10, 10, 10)) +
+      coord_fixed(ratio = 1)
+
+    save_plot(p, file.path(out_subdir, paste0(safe_name(term), "_tileplot.pdf")),
+              width  = n_genes * tile_size + 3,
+              height = n_clusters * tile_size + 2, quiet = TRUE, show = FALSE)
+    1L
+  }, future.seed = TRUE)
+  message("Wrote ", sum(unlist(n_written)), " tileplots to ", out_subdir)
+}
+
+run_gsea_plots <- function(scope_name, clusters_in_scope) {
+  gdir <- file.path("GSEA", scope_name)
+  tdir <- file.path(gdir, "Genes_by_cluster")
+
+  results_in_scope <- purrr::compact(gsea_results[clusters_in_scope])
+  if (!length(results_in_scope)) {
+    message("No GSEA results in scope ", scope_name); return(invisible(NULL))
+  }
+
+  # ---- Dotplot of the top terms per cluster ----
+  plot_data <- purrr::imap_dfr(results_in_scope, function(obj, cl) {
+    get_gsea_df(obj) %>%
+      dplyr::filter(!is.na(p.adjust), !is.na(NES)) %>%
+      dplyr::arrange(p.adjust) %>% dplyr::slice_head(n = 10) %>%
+      dplyr::mutate(cluster = cl)
+  })
+
+  if (!nrow(plot_data)) {
+    message("No enriched terms to plot for scope ", scope_name)
+  } else {
+    df_gse <- plot_data %>%
+      dplyr::select(Description, cluster, NES, p.adjust) %>%
+      dplyr::mutate(logFDR = -log10(p.adjust),
+                    Description = factor(Description,
+                      levels = rev(names(sort(table(Description), decreasing = TRUE)))))
+
+    p_dot <- ggplot(df_gse, aes(x = cluster, y = Description)) +
+      geom_point(aes(size = logFDR, color = NES)) +
+      scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+      theme_minimal() +
+      labs(x = "Cluster", y = "GO:BP term", size = "-log10(FDR)", color = "NES",
+           title = paste0("GSEA (GO:BP) - ", scope_name,
+                          "  [Misspecified = vs rest (all other cells)]")) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    save_plot(p_dot, file.path(gdir, paste0("GSEA_dotplot_", scope_name, ".pdf")),
+              8.5, 9)
+  }
+
+  # ---- Per-term gene-by-cluster tileplots ----
+  top_terms <- purrr::imap_dfr(results_in_scope, ~ get_gsea_df(.x) %>%
+                                 dplyr::filter(!is.na(p.adjust)) %>%
+                                 dplyr::arrange(p.adjust) %>%
+                                 dplyr::slice_head(n = 80) %>%
+                                 dplyr::select(Description)) %>%
+    dplyr::distinct(Description) %>% dplyr::pull(Description)
+  if (!length(top_terms)) {
+    message("No terms for tileplots in scope ", scope_name); return(invisible(NULL))
+  }
+
+  term_to_clusters <- purrr::imap_dfr(results_in_scope, function(obj, cluster) {
+    df <- get_gsea_df(obj)
+    if (!"Description" %in% colnames(df)) return(NULL)
+    df %>% dplyr::filter(Description %in% top_terms) %>%
+      dplyr::distinct(Description) %>% dplyr::mutate(cluster = cluster)
+  }) %>% dplyr::group_by(Description) %>%
+    dplyr::summarise(clusters = paste(sort(unique(cluster)), collapse = ", "),
+                     .groups = "drop")
+
+  term_genes <- collect_term_genes(results_in_scope, top_terms,
+                                   gene_col = "core_enrichment",
+                                   to_df = get_gsea_df)
+  if (!nrow(term_genes)) {
+    message("No core-enrichment genes for scope ", scope_name); return(invisible(NULL))
+  }
+
+  term_logfc_data <- term_genes %>%
+    dplyr::left_join(logfc_for_genes(DE_combined_all, unique(term_genes$gene),
+                                     clusters_in_scope, DE),
+                     by = "gene", relationship = "many-to-many") %>%
+    dplyr::filter(!is.na(avg_log2FC))
+  if (!nrow(term_logfc_data)) {
+    message("No log2FC matches for tileplots in scope ", scope_name)
+    return(invisible(NULL))
+  }
+
+  render_term_tileplots(term_logfc_data, term_to_clusters, tdir)
+  message("Wrote GSEA plots for scope: ", scope_name)
+}
+
+run_gsea_plots("ALL_NEURONAL", scope_clusters$ALL_NEURONAL)
+run_gsea_plots("PYRAMIDS",     scope_clusters$PYRAMIDS)
+```
+
+**Running-enrichment plots for the misspecified clusters.** The classic GSEA figure: genes are laid out left to right in ranked order, the curve traces the running enrichment score as you walk down that list, and the ticks below mark where the term's own genes fall.
+
+A curve peaking early, with ticks bunched at the left, means the term's genes sit at the top of the ranking. A curve dipping late means the opposite. The panel is drawn for a curated list of developmental gene sets, and only for terms the analysis actually returned.
+
+```{r leading_edge}
+# Leading-edge plots for the Misspecified cluster. Its ranking is one-vs-rest
+# (against all other cells), which is the contrast expected to surface the broad
+# developmental programme.
+LE_SOURCES <- intersect(PRIVATE_CLUSTERS, names(gsea_results))
+
+terms_of_interest <- c(
+  "forebrain development",
+  "positive regulation of cell adhesion",
+  "regulation of Wnt signaling pathway",
+  "Wnt signaling pathway",
+  "regulation of neuron differentiation",
+  "regulation of cell cycle phase transition",
+  "neuronal stem cell population maintenance",
+  "regulation of neurogenesis",
+  "regulation of BMP signaling pathway",
+  "positive regulation of Notch signaling pathway",
+  "cell proliferation in forebrain",
+  "regulation of synaptic transmission, glutamatergic",
+  "stem cell population maintenance",
+  "regulation of neuronal synaptic plasticity"
+)
+
+combined_terms <- c("pattern specification process", "cell-cell signaling by Wnt",
+                    "regulation of synaptic transmission, glutamatergic",
+                    "regulation of neuron differentiation")
+
+for (src in LE_SOURCES) {
+  gsea_obj <- gsea_results[[src]]
+  gsea_df  <- get_gsea_df(gsea_obj)
+  src_tag  <- safe_name(src)
+
+  available_terms <- intersect(terms_of_interest, gsea_df$Description)
+  if (!length(available_terms))
+    message("None of terms_of_interest present in ", src,
+            " - inspect get_gsea_df(gsea_results[['", src, "']]) for actual names")
+
+  for (term in available_terms) {
+    term_id <- gsea_df$ID[gsea_df$Description == term][1]
+    p <- enrichplot::gseaplot2(gsea_obj, geneSetID = term_id,
+                               title = paste0(term, " - ", src))
+    save_plot(p, file.path("GSEA/leading_edge",
+                           paste0(safe_name(term), "_", src_tag, "_gseaplot2.pdf")),
+              7, 6)
+  }
+
+  terms_to_plot <- intersect(combined_terms, gsea_df$Description)
+  if (!length(terms_to_plot)) {
+    message("No combined-plot terms found for ", src); next
+  }
+  term_ids <- vapply(terms_to_plot,
+                     function(t) gsea_df$ID[gsea_df$Description == t][1], character(1))
+  combined_plot <- enrichplot::gseaplot2(
+    gsea_obj, geneSetID = term_ids,
+    title = paste0("GSEA in ", src, " cells (vs rest)"),
+    pvalue_table = TRUE, base_size = 18, subplots = 1:2,
+    rel_heights = c(1, 0.3),
+    color = c("#1A5354", "firebrick", "#F79D1E", "blue")[seq_along(terms_to_plot)])
+  save_plot(combined_plot,
+            file.path("GSEA/leading_edge",
+                      paste0("combined_leading_edge_", src_tag, ".pdf")), 12, 8)
+}
+```
+
+# Curated gene sets
+
+**Curated layer markers, and the supplementary feature-plot panels.**
+
+The first figure is a tile plot of canonical cortical layer markers: x-axis gene, y-axis cluster, colour is log2 fold-change. It answers a narrower question than the genome-wide heatmaps — how do the genes that *define* layer identity behave in each cluster?
+
+The FigS11 and FigS12 panels that follow are UMAP feature plots split by genotype. Each gene occupies a row with wild-type and mutant side by side, and colour is expression with the scale shared within a gene so the two genotypes are directly comparable. They are drawn in batches of three genes: the full composite is written to file for use as a figure, but at ~2 columns by 12 rows it is unreadable when scaled into a report.
+
+```{r customgeneset, fig.width=7, fig.height=9}
+# Layer-marker tileplot. Fold changes are PSEUDOBULK from DE_combined_all:
+# shared clusters = DKO-vs-WT, Misspecified = one-vs-rest.
+custom_gene_set <- c("Eomes","Tbr1","Sox5","Fezf2","Tle4","Foxp2","Bcl11b",
+                     "Satb2","Rorb","Etv1","Cux1","Pou3f1","Pou3f2","Lhx2","Cux2")
+gene_set_label <- "Layer Markers"
+
+logfc_table <- DE_combined_all %>%
+  dplyr::filter(gene %in% custom_gene_set, cluster_named %in% PYR_SCOPE) %>%
+  dplyr::select(gene, avg_log2FC, cluster = cluster_named)
+
+if (!nrow(logfc_table)) {
+  message("No matching genes for: ", gene_set_label)
+} else {
+  gene_order <- logfc_table %>% dplyr::group_by(gene) %>%
+    dplyr::summarise(score = mean(abs(avg_log2FC), na.rm = TRUE), .groups = "drop") %>%
+    dplyr::arrange(desc(score)) %>% dplyr::pull(gene)
+  plot_df <- logfc_table %>% dplyr::mutate(gene = factor(gene, levels = gene_order))
+
+  n_genes    <- length(unique(plot_df$gene))
+  n_clusters <- length(unique(plot_df$cluster))
+  if (n_genes >= 2 && n_clusters >= 2) {
+    p <- ggplot(plot_df, aes(x = gene, y = cluster, fill = avg_log2FC)) +
+      geom_tile(color = "white") +
+      scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+      theme_minimal(base_size = 11) +
+      labs(title = paste("log2FC:", gene_set_label), x = "Gene", y = "Cluster",
+           fill = "log2FC\n(shared=DKO/WT;\nMisspec=vs rest)") +
+      theme(axis.text.x = element_text(size = 14, angle = 45, hjust = 1),
+            axis.text.y = element_text(size = 14),
+            plot.title  = element_text(size = 16, face = "bold")) +
+      coord_fixed(ratio = 1)
+    save_plot(p, file.path("custom_genes",
+                           paste0(safe_name(gene_set_label), "_tileplot.pdf")),
+              width = n_genes * 0.3 + 4, height = n_clusters * 0.3 + 2)
+  }
+}
+
+# ---- FigS11 / FigS12 multi-gene FeaturePlots ----
+FigS11_genes <- c("Grin1","Rbfox3","Satb2","Bcl11b","Cux1","Sox5",
+                  "Tubb3","Dcx","Pou3f2","Fezf2","Rorb","Foxp2")
+FigS12_genes <- c("Pcna","Sox2","Notch1","Dll1","Mki67","Top2a","Notch2","Hes5")
+
+DefaultAssay(sc_seurat) <- "RNA"
+
+# These are multi-gene FeaturePlots split by genotype, so the composite is very
+# tall (2 columns x one row per gene). At full size it is unreadable when scaled
+# into a report, so the composite is written to file for use as a figure and the
+# report instead shows batches of a few genes at a time.
+plot_feature_batches <- function(genes, tag, batch = 3) {
+  genes <- intersect(genes, rownames(sc_seurat))
+  if (!length(genes)) return(invisible(NULL))
+
+  p_full <- FeaturePlot(sc_seurat, features = genes, coord.fixed = TRUE,
+                        split.by = "Genotype", pt.size = 0.1, order = TRUE,
+                        cols = c("lightblue", "darkblue"), keep.scale = "feature")
+  save_plot(p_full, file.path("custom_genes", paste0(tag, "_gene_expression_all.pdf")),
+            width = 12, height = 4 * length(genes), show = FALSE)
+
+  idx <- split(seq_along(genes), ceiling(seq_along(genes) / batch))
+  for (i in seq_along(idx)) {
+    g <- genes[idx[[i]]]
+    p <- FeaturePlot(sc_seurat, features = g, coord.fixed = TRUE,
+                     split.by = "Genotype", pt.size = 0.1, order = TRUE,
+                     cols = c("lightblue", "darkblue"), keep.scale = "feature")
+    save_plot(p, file.path("custom_genes",
+                           sprintf("%s_part%02d.pdf", tag, i)),
+              width = 6, height = 3 * length(g))
+  }
+}
+
+plot_feature_batches(FigS11_genes, "FigS11")
+plot_feature_batches(FigS12_genes, "FigS12")
+```
+
+# Over-representation analysis (enrichGO)
+
+**How the layer markers themselves redistribute.** The cluster-based analyses answer "how do the *groups* change"; these four figures ask "how do the *markers* change", which does not depend on where cluster boundaries were drawn. All are restricted to the pyramidal lineage and computed within genotype.
+
+**1. Dumbbell plot.** For each layer marker, the percentage of nuclei in which it is detected: a grey point for wild-type, a red point for mutant, joined by a line whose length is the change. Markers are grouped by the panel they belong to. Read the *direction and length* of the lines — a clean upper-versus-deep swap would show all upper markers moving right and all deep markers moving left.
+
+**2. Marker-score identity.** Each nucleus is scored against three marker panels and assigned to whichever scores highest, then composition is plotted per genotype. No cluster labels are used anywhere in this figure, so it is an independent check on the cluster-based composition.
+
+**3. Upper versus deep score.** A two-dimensional density with the upper-layer score on x and the deep-layer score on y, one panel per genotype, with a diagonal marking equal scores. Nuclei with a clear identity sit off the diagonal; nuclei near it express both programmes or neither.
+
+**4. Specification axis.** The same information collapsed to one number per nucleus — upper score minus deep score — plotted as a density per genotype. Zero means the two programmes are balanced; negative is deep-leaning, positive upper-leaning. A shift of the whole distribution is a shift in the balance of layer identity across the population.
+
+```{r layer_marker_proportions, fig.width=9, fig.height=7, message=TRUE}
+# =============================================================================
+# PROPORTIONAL CHANGE OF LAYER MARKERS
+#
+# Four views, all restricted to the excitatory (projection-neuron) lineage and
+# all computed within genotype so the ~2x recovery difference cancels:
+#
+#   1. dumbbell   - % of nuclei expressing each layer marker, WT vs DKO
+#   2. identity   - each nucleus assigned to the marker panel it scores highest
+#                   on, giving a composition that does not use cluster labels
+#   3. 2D density - upper- vs deep-layer score per nucleus
+#   4. axis       - distribution of (upper - deep) score, i.e. where each
+#                   nucleus sits on the specification axis
+# =============================================================================
+LAYER_PANELS <- list(
+  `Upper layer (L2/3-4)` = c("Cux1","Cux2","Satb2","Pou3f2","Pou3f3","Unc5d","Rorb"),
+  `Deep layer (L5-6)`    = c("Bcl11b","Fezf2","Sox5","Tbr1","Foxp2","Tle4","Etv1","Nr4a2"),
+  `Subplate / L6b`       = c("Nxph4","Cplx3","Ccn2","Ctgf","Lpar1","Moxd1"))
+LAYER_PANELS <- lapply(LAYER_PANELS, intersect, y = rownames(sc_seurat))
+PANEL_COLS <- c("Upper layer (L2/3-4)" = "#4C72B0",
+                "Deep layer (L5-6)"    = "#DD8452",
+                "Subplate / L6b"       = "#55A868")
+
+neu <- cells_in_clusters(sc_seurat, PYR_SCOPE)
+message("Marker analysis on ", ncol(neu), " excitatory-lineage nuclei; panels: ",
+        paste(lengths(LAYER_PANELS), collapse = "/"), " genes")
+
+# ---- 1. proportion of nuclei expressing each marker -------------------------
+mk  <- unique(unlist(LAYER_PANELS))
+key <- utils::stack(LAYER_PANELS); names(key) <- c("gene", "panel")
+pct <- FetchData(neu, vars = c(mk, "Genotype")) %>%
+  tidyr::pivot_longer(all_of(mk), names_to = "gene", values_to = "e") %>%
+  group_by(gene, Genotype) %>%
+  summarise(pct = 100 * mean(e > 0), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = Genotype, values_from = pct) %>%
+  left_join(key, by = "gene") %>%
+  mutate(delta = .data[[DKO]] - .data[[WT_LAB]],
+         gene  = factor(gene, levels = gene[order(panel, delta)]))
+save_table(pct %>% arrange(panel, desc(abs(delta))),
+           "layer_marker_percent_expressing.csv")
+
+p <- ggplot(pct) +
+  geom_segment(aes(y = gene, yend = gene, x = .data[[WT_LAB]], xend = .data[[DKO]]),
+               colour = "grey70", linewidth = 1) +
+  geom_point(aes(y = gene, x = .data[[WT_LAB]], colour = "WT"), size = 3) +
+  geom_point(aes(y = gene, x = .data[[DKO]], colour = "NeuroD2_D6DKO"), size = 3) +
+  scale_colour_manual(values = GENOTYPE_COLORS, name = NULL) +
+  facet_grid(panel ~ ., scales = "free_y", space = "free_y") +
+  labs(x = "% of excitatory-lineage nuclei expressing marker", y = NULL,
+       title = "Proportional change in layer-marker expression",
+       subtitle = "within-genotype percentages, so uneven recovery cancels") +
+  theme_minimal(base_size = 11) + theme(strip.text.y = element_text(angle = 0))
+save_plot(p, "layer_markers/marker_percent_expressing_dumbbell.pdf", 8, 7)
+
+# ---- 2. identity from marker scores, not from clusters ----------------------
+neu <- AddModuleScore(neu, features = LAYER_PANELS, name = "lp_", seed = 42)
+sc_cols <- paste0("lp_", seq_along(LAYER_PANELS))
+colnames(neu@meta.data)[match(sc_cols, colnames(neu@meta.data))] <- names(LAYER_PANELS)
+md <- neu@meta.data[, c(names(LAYER_PANELS), "Genotype", "cluster_named")]
+md$assigned <- names(LAYER_PANELS)[
+  max.col(as.matrix(md[, names(LAYER_PANELS)]), ties.method = "first")]
+
+comp_mk <- md %>% count(Genotype, assigned) %>% group_by(Genotype) %>%
+  mutate(pct = 100 * n / sum(n)) %>% ungroup()
+print(as.data.frame(comp_mk))
+save_table(comp_mk, "layer_marker_identity_composition.csv")
+
+p <- ggplot(comp_mk, aes(x = Genotype, y = pct, fill = assigned)) +
+  geom_col(colour = "white", linewidth = 0.2) +
+  scale_fill_manual(values = PANEL_COLS, name = "Best-scoring panel") +
+  labs(y = "% of excitatory-lineage nuclei", x = NULL,
+       title = "Identity assigned by layer-marker score",
+       subtitle = "cluster labels not used") +
+  theme_minimal(base_size = 11)
+save_plot(p, "layer_markers/marker_score_identity_composition.pdf", 6, 5)
+
+# ---- 3. upper vs deep score per nucleus -------------------------------------
+p <- ggplot(md, aes(x = .data[[names(LAYER_PANELS)[1]]],
+                    y = .data[[names(LAYER_PANELS)[2]]])) +
+  geom_bin2d(bins = 60) +
+  scale_fill_viridis_c(trans = "log10", name = "nuclei") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+  facet_wrap(~Genotype) + coord_fixed() +
+  labs(title = "Upper- versus deep-layer marker score, per nucleus",
+       x = "Upper-layer score", y = "Deep-layer score") +
+  theme_minimal(base_size = 11)
+save_plot(p, "layer_markers/UL_vs_DL_score_density.pdf", 9, 5)
+
+# ---- 4. the specification axis ----------------------------------------------
+md$axis <- md[[names(LAYER_PANELS)[1]]] - md[[names(LAYER_PANELS)[2]]]
+p <- ggplot(md, aes(x = axis, fill = Genotype, colour = Genotype)) +
+  geom_density(alpha = 0.35, linewidth = 0.6) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_fill_manual(values = GENOTYPE_COLORS) +
+  scale_colour_manual(values = GENOTYPE_COLORS) +
+  labs(x = "upper-layer score  -  deep-layer score", y = "density",
+       title = "Position of each nucleus on the upper/deep specification axis",
+       subtitle = "left = deep-layer character, right = upper-layer character") +
+  theme_minimal(base_size = 11)
+save_plot(p, "layer_markers/specification_axis_density.pdf", 8, 5)
+
+axis_summary <- md %>% group_by(Genotype) %>%
+  summarise(median_axis = round(median(axis), 3),
+            pct_upper_leaning = round(100 * mean(axis > 0), 1), .groups = "drop")
+print(as.data.frame(axis_summary))
+save_table(axis_summary, "layer_marker_specification_axis.csv")
+rm(neu); invisible(gc(verbose = FALSE))
+```
+
+**Requested interneuron and vascular markers.** UMAP feature plots (pooled and split by genotype) and per-cluster violins for a specific marker panel.
+
+The detection-rate table printed above the plots should be read first. At E15 most mature interneuron subclass markers are barely expressed — several are detected in well under 1% of nuclei — so the corresponding feature plots are close to empty. That absence is itself the result: these subclass identities have not yet been established at this age. Any marker not present in the expression matrix at all is listed explicitly rather than silently skipped.
+
+```{r requested_marker_panel, fig.width=9, fig.height=5}
+REQUESTED_MARKERS <- c("Lamp5", "Meis2", "Pvalb", "Sst", "Vip", "Sncg")
+VLMC_MARKERS      <- c("Slc6a13", "Dcn", "Col1a1", "Lum", "Ptgds")
+PANEL_GENES <- c(REQUESTED_MARKERS, VLMC_MARKERS)
+
+available <- intersect(PANEL_GENES, rownames(sc_seurat))
+absent    <- setdiff(PANEL_GENES, rownames(sc_seurat))
+if (length(absent))
+  cat("Not in the expression matrix (fewer than 3 nuclei at object creation): ",
+      paste(absent, collapse = ", "), "\n", sep = "")
+
+detect <- FetchData(sc_seurat, vars = c(available, "Genotype")) %>%
+  tidyr::pivot_longer(all_of(available), names_to = "gene", values_to = "e") %>%
+  group_by(gene, Genotype) %>%
+  summarise(pct_expressing = round(100 * mean(e > 0), 3),
+            mean_expr = round(mean(e), 4), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = Genotype,
+                     values_from = c(pct_expressing, mean_expr))
+print(as.data.frame(detect))
+save_table(detect, "requested_marker_detection_rates.csv")
+
+save_feature_plots(sc_seurat, genes = available, reduction = "umap",
+                   plotdir = "requested_markers")
+save_feature_plots_split(sc_seurat, genes = available, reduction = "umap",
+                         plotdir = "requested_markers")
+
+plan_fork()
+invisible(future.apply::future_lapply(available, function(gene) {
+  worker_setup()
+  p <- suppressMessages(VlnPlot(sc_seurat, features = gene, group.by = "cluster_named",
+               split.by = "Genotype", cols = GENOTYPE_COLORS, pt.size = 0.1)) +
+    ggtitle(gene) +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.x = element_text(angle = 45, hjust = 1))
+  save_plot(p, file.path("requested_markers",
+                         paste0(gene, "_violin_by_cluster.pdf")),
+            9, 4, quiet = TRUE, show = FALSE)
+}, future.seed = TRUE))
+cat("Requested-marker panel written for", length(available), "genes:",
+    paste(available, collapse = ", "), "\n")
+```
+
+**Over-representation analysis.** Unlike GSEA, which uses the whole ranked list, this asks whether a fixed set of strongly changed genes contains more members of a GO term than chance would predict.
+
+The **dot plot** is faceted by direction — genes up in the mutant on one side, down on the other. X-axis is cluster, y-axis term, colour is −log10(adjusted p), and point size is the number of genes from the query set found in that term. The **per-term tile plots** that follow have the same construction as the GSEA ones: genes on x, clusters on y, colour is pseudobulk log2 fold-change.
+
+```{r enrichGO, fig.width=14, fig.height=9}
+# =============================================================================
+# ORA with gene sets defined by PSEUDOBULK EFFECT SIZE, not per-cell FindMarkers
+# p-values (invalid at n = 1). Genes are selected by |pseudobulk log2FC| from
+# DE_combined_all and split up/down by sign. Shared clusters = DKO-vs-WT;
+# Misspecified = one-vs-rest. No per-gene significance is claimed.
+# =============================================================================
+LOG2FC_CUTOFF <- 1
+MIN_CPM_ORA   <- 5
+
+# Minimum genes a GO term must contain to be eligible for the summary dotplot.
+# The 2026 file used 10. A ~150-gene ORA query overlaps a GO:BP term in a
+# handful of genes, so at 10 only 4 of 14 clusters contributed any term and the
+# dotplot was effectively the Misspecified cluster alone; at 5 it is 12 of 14.
+ORA_MIN_COUNT <- 5
+
+ORA_CLUSTERS <- intersect(NEURONAL_CLUSTERS,
+                          as.character(unique(DE_combined_all$cluster_named)))
+
+#' enrichGO on one gene vector, returning the result table with a rich factor.
+#' OrgDb is passed as a string so this is safe in a fresh worker session. Note
+#' this function runs inside multisession workers, which do not inherit attached
+#' packages - so everything here is either base R or :: qualified (no %>%).
+run_enrichGO <- function(genes) {
+  if (length(genes) < 5) return(NULL)
+  go <- clusterProfiler::enrichGO(
+    gene = genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP",
+    readable = FALSE, minGSSize = 10, maxGSSize = 300,
+    pAdjustMethod = "BH", pvalueCutoff = 0.05, qvalueCutoff = 0.2)
+  if (is.null(go) || !nrow(go@result)) return(NULL)
+  res <- as.data.frame(go@result)
+  ratio_num <- function(x) vapply(strsplit(x, "/"),
+                                  function(p) as.numeric(p[1]) / as.numeric(p[2]),
+                                  numeric(1))
+  res$GeneRatio_num <- ratio_num(res$GeneRatio)
+  res$BgRatio_num   <- ratio_num(res$BgRatio)
+  res$RichFactor    <- res$GeneRatio_num / res$BgRatio_num
+  res
+}
+
+# Gene vectors are built up front (cheap, and keeps the DE tables out of the
+# workers), then the ORA calls themselves run in parallel.
+ora_gene_sets <- c(
+  lapply(setNames(ORA_CLUSTERS, ORA_CLUSTERS), function(clust) {
+    de_c <- DE_combined_all %>%
+      dplyr::filter(cluster_named == clust, !is.na(avg_log2FC),
+                    mean_cpm > MIN_CPM_ORA)
+    list(up   = de_c %>% dplyr::filter(avg_log2FC >  LOG2FC_CUTOFF) %>% dplyr::pull(gene),
+         down = de_c %>% dplyr::filter(avg_log2FC < -LOG2FC_CUTOFF) %>% dplyr::pull(gene))
+  }),
+  list(all = local({
+    de_c <- DE %>% dplyr::filter(!is.na(avg_log2FC), mean_cpm > MIN_CPM_ORA)
+    list(up   = de_c %>% dplyr::filter(avg_log2FC >  LOG2FC_CUTOFF) %>% dplyr::pull(gene),
+         down = de_c %>% dplyr::filter(avg_log2FC < -LOG2FC_CUTOFF) %>% dplyr::pull(gene))
+  }))
+)
+for (nm in names(ora_gene_sets)) {
+  message("enrichGO input '", nm, "': ", length(ora_gene_sets[[nm]]$up), " up / ",
+          length(ora_gene_sets[[nm]]$down), " down genes")
+}
+
+plan_session()
+go_enrich_raw <- future.apply::future_lapply(ora_gene_sets, function(gs) {
+  worker_setup()
+  res <- list()
+  go_up   <- run_enrichGO(gs$up)
+  go_down <- run_enrichGO(gs$down)
+  if (!is.null(go_up))   { go_up$direction   <- "up";   res$up   <- go_up   }
+  if (!is.null(go_down)) { go_down$direction <- "down"; res$down <- go_down }
+  if (!length(res)) return(NULL)
+  dplyr::bind_rows(res)
+}, future.seed = TRUE)
+names(go_enrich_raw) <- names(ora_gene_sets)
+go_enrich_results <- purrr::compact(go_enrich_raw)
+
+for (nm in names(go_enrich_results)) {
+  save_table(go_enrich_results[[nm]] %>% dplyr::select(dplyr::any_of(
+               c("ID","Description","direction","GeneRatio","BgRatio","RichFactor",
+                 "pvalue","p.adjust","qvalue","Count","geneID"))),
+             file.path("enrichGO", paste0("enrichGO_", safe_name(nm), ".csv")))
+}
+
+if (!length(go_enrich_results)) {
+  message("No enrichGO results - try lowering LOG2FC_CUTOFF")
+} else {
+  top_terms <- go_enrich_results %>%
+    purrr::imap_dfr(~ .x %>% dplyr::filter(p.adjust < 0.05, Count >= ORA_MIN_COUNT) %>%
+                      dplyr::arrange(desc(RichFactor)) %>% dplyr::slice_head(n = 3) %>%
+                      dplyr::mutate(cluster = .y))
+
+  plot_data <- purrr::imap_dfr(go_enrich_results, function(res, cl) {
+    res %>% dplyr::filter(Description %in% top_terms$Description) %>%
+      dplyr::mutate(cluster = cl)
+  })
+
+  if (nrow(plot_data)) {
+    df_ora <- plot_data %>%
+      dplyr::select(Description, cluster, direction, GeneRatio_num,
+                    p.adjust, Count, RichFactor) %>%
+      dplyr::mutate(logFDR = -log10(p.adjust),
+                    direction = factor(direction, levels = c("up", "down")),
+                    Description = factor(Description, levels = rev(unique(Description))))
+
+    p <- ggplot(df_ora, aes(x = cluster, y = Description)) +
+      geom_point(aes(color = logFDR, size = Count)) +
+      scale_color_gradient(low = "blue", high = "red") +
+      scale_size_area(max_size = 10) +
+      theme_minimal() +
+      labs(x = "Cluster", y = "GO:BP term", size = "Gene count",
+           color = "-log10(adj. p)",
+           title = paste0("ORA (enrichGO) - neuronal | |log2FC|>", LOG2FC_CUTOFF,
+                          " [Misspecified = vs rest]")) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      facet_wrap(~direction)
+    save_plot(p, "enrichGO/enrichGO_dot_plot_combined.pdf", 12, 8)
+  }
+
+  # ---- Gene-by-cluster tileplots for the ORA terms ----
+  ora_top_terms <- go_enrich_results %>%
+    purrr::imap_dfr(~ .x %>% dplyr::filter(p.adjust < 0.05) %>%
+                      dplyr::arrange(p.adjust) %>% dplyr::slice_head(n = 80) %>%
+                      dplyr::select(Description)) %>%
+    dplyr::distinct(Description) %>% dplyr::pull(Description)
+
+  ora_term_to_clusters <- go_enrich_results %>%
+    purrr::imap_dfr(function(res, cl) {
+      res %>% dplyr::filter(Description %in% ora_top_terms) %>%
+        dplyr::distinct(Description) %>% dplyr::mutate(cluster = cl)
+    }) %>% dplyr::group_by(Description) %>%
+    dplyr::summarise(clusters = paste(sort(unique(cluster)), collapse = ", "),
+                     .groups = "drop")
+
+  ora_term_genes <- collect_term_genes(go_enrich_results, ora_top_terms,
+                                       gene_col = "geneID")
+
+  if (!nrow(ora_term_genes)) {
+    message("No enrichGO term genes for tileplots")
+  } else {
+    ora_term_logfc <- ora_term_genes %>%
+      dplyr::left_join(logfc_for_genes(DE_combined_all, unique(ora_term_genes$gene),
+                                       c(ORA_CLUSTERS, "all"), DE),
+                       by = "gene", relationship = "many-to-many") %>%
+      dplyr::filter(!is.na(avg_log2FC))
+    render_term_tileplots(ora_term_logfc, ora_term_to_clusters,
+                          "enrichGO/Genes_by_cluster")
+  }
+}
+```
+
+# Gene sets for the per-gene figures
+
+Assembles the gene list used for the per-gene violin and UMAP figures: the strongly changed genes, a curated always-include list, and the top markers of the misspecified clusters. No figures.
+
+```{r gene_sets}
+# Defined in its own chunk because the violin chunk below is disabled by default
+# but the UMAP export chunk still needs this list. (In the 2026 file this vector
+# was created inside the violin chunk, so skipping violins broke the UMAPs.)
+
+# Top one-vs-rest genes for the Misspecified cluster, so the strongest markers of
+# the aberrant population are always plotted even if they miss the shared cutoffs.
+N_MISSPEC_TOP <- 25
+
+misspec_top_genes <- DE_combined_all %>%
+  dplyr::filter(comparison == "Misspec_vs_Rest", !is.na(avg_log2FC), mean_cpm > 5) %>%
+  dplyr::group_by(cluster_named) %>%
+  dplyr::group_modify(~ dplyr::bind_rows(
+    dplyr::slice_max(.x, avg_log2FC, n = N_MISSPEC_TOP),
+    dplyr::slice_min(.x, avg_log2FC, n = N_MISSPEC_TOP))) %>%
+  dplyr::ungroup() %>% dplyr::pull(gene) %>% unique()
+
+# Curated genes that always get a plot regardless of selection.
+PLOT_ALWAYS <- unique(c(
+  "Nr4a2","Rorb","Neurod1","Satb2","Bcl11b","Fezf2","Unc5d","Cux2","Cux1","Eomes",
+  "Pax6","Tbr1","Neurod2","Neurod6","Btg2","Id2","Id3","Epha3","Robo2","Top2a",
+  "Hs6st3","Tafa2","Gad1","Gad2","Lhx6","Reln","Rmst","Nfib","Zbtb20","Cdk14",
+  "Sox6","Npas3","Scrt2","Ntng2","Sox2ot","Dach1","Dpp10","Tcf7l2","Dgkg",
+  "Gabra2","Elmod1","Fam135b","Hhip","Gpat3","Adcy7","Dkk2","Scube2","Crlf1",
+  "Sox2","Mki67","Pcna","Tubb3","Dcx","Map2","Ncam1","Rbfox3","Gap43","Egfr",
+  "Bdnf","Eno2","Pou3f3","Pou3f2","Sox5","Pou3f1","Olig2","Hes1","Hes5","Notch1",
+  "Notch2","Robo1","Ebf1","Grin1","Ebf2","Ebf3","Dll1","Kdm1a","Hdac9","Cdkn1c",
+  "Insm1","Smarcd3","Dpf3","Tiam2","Pak3","Hes6","Gadd45g","Prox1","Emx2","Nhlh1",
+  "Ptprd","Bcl11a","Lmo1","Sema3a","Sema3c","Hrk","Runx1t1","Cxcr4","Ackr3",
+  "Dlx2","Pvalb","Sst","Htr3a","Mast1","Adck1"))
+
+PLOT_GENES <- Reduce(union, list(genes_pyr_fc, FORCE_GENES,
+                                 PLOT_ALWAYS, misspec_top_genes))
+PLOT_GENES <- intersect(PLOT_GENES, rownames(sc_seurat))
+
+message("Per-gene figure set: ", length(PLOT_GENES), " genes across ",
+        length(PYR_SCOPE), " pyramidal clusters")
+save_table(data.frame(gene = PLOT_GENES), "per_gene_figure_gene_list.csv")
+```
+
+**Violin plots, five views per gene.** A violin shows the full distribution of expression rather than just a mean, which matters for single-cell data where a gene is often off in most nuclei and high in a few.
+
+1. **Split across clusters** — one panel per gene, clusters on the x-axis, wild-type and mutant drawn side by side.
+2. **Per cluster** — the same comparison one cluster at a time, so a single population can be inspected without the others compressing the axis.
+3. **Per cluster, non-zero nuclei only** — identical to (2) but excluding nuclei where the gene is undetected. When a gene is expressed in a minority of cells the zeros dominate the shape and hide any difference in the cells that do express it.
+4. **All clusters, non-zero, dodged.**
+5. **Pooled across pyramidal clusters** — cluster identity collapsed, giving a single genotype comparison per gene.
+
+Several thousand files are written to `plots/Violin/`; they are not embedded in this report.
+
+```{r DE_gene_plots}
+# =============================================================================
+# VIOLIN PLOTS. Thousands of individual PDFs - the slowest chunk in the file.
+#
+# NOTE on the Misspecified cluster: it has no WT cells, so its within-cluster
+# genotype violins (sections 2-3) are single-sided. The DKO distribution still
+# renders; there is simply no WT to compare against inside that cluster, which
+# mirrors the heatmap logic.
+#
+# Sections 4 and 5 in the 2026 file iterated over a leftover 9-gene scratch
+# vector named `temp` instead of the real gene set - fixed here.
+#
+# PARALLELISATION SHAPE. Sections 2 and 3 produce one plot per gene x cluster
+# (~250 x 10 = 2500 each). Subsetting the Seurat object inside that loop would
+# mean ~5000 subsets of a 31k-cell object and would dominate the runtime, so the
+# loop is inverted: fan out over CLUSTERS, subset once per cluster in the worker,
+# then loop genes inside. 10 subsets instead of 5000.
+# =============================================================================
+viol_dir <- "Violin"
+n_genes    <- length(PLOT_GENES)
+n_clusters <- length(PYR_SCOPE)
+
+# Pyramidal subset used by every section, built once with ordered cluster levels.
+pyramids_seurat <- cells_in_clusters(sc_seurat, PYR_SCOPE)
+pyramids_seurat$cluster_named <- factor(as.character(pyramids_seurat$cluster_named),
+                                        levels = PYR_SCOPE)
+DefaultAssay(pyramids_seurat) <- "RNA"
+
+message("Violins: ", n_genes, " genes x ", n_clusters, " clusters -> ~",
+        format(2 * n_genes * n_clusters + 3 * n_genes, big.mark = ","), " PDFs")
+
+plan_fork()
+
+# ---- 1. All clusters, split violin ----
+message("=== Section 1: all-cluster split violins (", n_genes, " genes) ===")
+invisible(future.apply::future_lapply(PLOT_GENES, function(gene) {
+  worker_setup()
+  p <- suppressMessages(VlnPlot(pyramids_seurat, features = gene, group.by = "cluster_named",
+               split.by = "Genotype", cols = GENOTYPE_COLORS, pt.size = 0.1)) +
+    ggtitle(gene) +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.x = element_text(angle = 45, hjust = 1))
+  save_plot(p, file.path(viol_dir, "default",
+                         paste0(gene, "_all_clusters_violin.pdf")), 8, 4, quiet = TRUE, show = FALSE)
+}, future.seed = TRUE))
+
+# ---- 2 + 3. Per cluster: default violin and non-zero-only violin ----
+# One worker per cluster; each subsets once, then loops its genes and writes both
+# the default and the non-zero plot for each.
+message("=== Sections 2+3: per-cluster violins (", n_genes * n_clusters,
+        " gene x cluster pairs, fanned out over ", n_clusters, " clusters) ===")
+invisible(future.apply::future_lapply(PYR_SCOPE, function(cluster) {
+  worker_setup()
+  sub  <- cells_in_clusters(pyramids_seurat, cluster)
+  safe <- safe_name(cluster)
+  # Fetch every gene for this cluster once, rather than per plot.
+  expr_all <- FetchData(sub, vars = c(intersect(PLOT_GENES, rownames(sub)), "Genotype"))
+  for (gene in intersect(PLOT_GENES, rownames(sub))) {
+    # 2. default violin, all cells
+    p <- suppressMessages(VlnPlot(sub, features = gene, group.by = "Genotype",
+                 cols = GENOTYPE_COLORS, pt.size = 0.1)) +
+      ggtitle(paste0(gene, " - ", cluster)) +
+      theme(plot.title = element_text(hjust = 0.5))
+    save_plot(p, file.path(viol_dir, "default",
+                           paste0(gene, "-", safe, "_violin.pdf")), 4, 4, quiet = TRUE, show = FALSE)
+
+    # 3. non-zero cells only
+    expr <- expr_all[expr_all[[gene]] > 0, c(gene, "Genotype"), drop = FALSE]
+    if (!nrow(expr)) next
+    p <- ggplot(expr, aes(x = Genotype, y = .data[[gene]], fill = Genotype)) +
+      geom_violin(trim = FALSE, scale = "width") +
+      geom_jitter(width = 0.2, size = 0.5, alpha = 0.5) +
+      scale_fill_manual(values = GENOTYPE_COLORS) +
+      theme_minimal() + ggtitle(paste0(gene, " - ", cluster)) + ylab("Expression") +
+      theme(plot.title = element_text(hjust = 0.5))
+    save_plot(p, file.path(viol_dir, "nonzero",
+                           paste0(gene, "-", safe, "_nonzero_violin.pdf")), 4, 4, quiet = TRUE, show = FALSE)
+  }
+  message("  violins done for cluster: ", cluster)
+  NULL
+}, future.seed = TRUE))
+
+# ---- 4. All clusters, non-zero, dodged ----
+message("=== Section 4: all-cluster nonzero violins ===")
+invisible(future.apply::future_lapply(PLOT_GENES, function(gene) {
+  worker_setup()
+  expr <- FetchData(pyramids_seurat, vars = c(gene, "cluster_named", "Genotype")) %>%
+    dplyr::filter(.data[[gene]] > 0)
+  if (!nrow(expr)) return(NULL)
+  p <- ggplot(expr, aes(x = cluster_named, y = .data[[gene]], fill = Genotype)) +
+    geom_violin(position = position_dodge(width = 0.8), trim = FALSE, scale = "width") +
+    geom_jitter(position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.8),
+                size = 0.5, alpha = 0.5) +
+    scale_fill_manual(values = GENOTYPE_COLORS) +
+    theme_minimal() + ggtitle(gene) + ylab("Expression") +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.x = element_text(angle = 45, hjust = 1))
+  save_plot(p, file.path(viol_dir, "nonzero",
+                         paste0(gene, "_all_clusters_nonzero_violin.pdf")), 9, 4, quiet = TRUE, show = FALSE)
+}, future.seed = TRUE))
+
+# ---- 5. Pooled across all pyramidal clusters ----
+message("=== Section 5: pooled pyramidal violins ===")
+invisible(future.apply::future_lapply(PLOT_GENES, function(gene) {
+  worker_setup()
+  p <- suppressMessages(VlnPlot(pyramids_seurat, features = gene, group.by = "Genotype",
+               cols = GENOTYPE_COLORS, pt.size = 0)) +
+    ggtitle(paste0(gene, " - all pyramidal cells")) +
+    theme(plot.title = element_text(hjust = 0.5)) + NoLegend()
+  save_plot(p, file.path(viol_dir, "pooled",
+                         paste0(gene, "_pooled_pyramids_violin.pdf")),
+              width = 2.2, height = 5, quiet = TRUE, show = FALSE)
+}, future.seed = TRUE))
+
+cat("Violin plots complete:", length(PLOT_GENES), "genes x ",
+    length(PYR_SCOPE), "clusters, written to plots/Violin/\n")
+```
+
+**Per-gene UMAP feature plots.** One figure per gene showing where in the embedding that gene is expressed, pooled and split by genotype, written to `plots/gene_umaps/`. Not embedded in this report — there are several hundred.
+
+```{r DE_gene_umaps}
+# FeaturePlot UMAPs for the same gene set, on the standard "umap" embedding.
+# A slim copy keeps each worker's memory footprint small.
+umap_obj <- DietSeurat(sc_seurat, features = PLOT_GENES, assays = "RNA",
+                       dimreducs = c("umap", "ref.umap"))
+message("Exporting UMAPs for ", length(PLOT_GENES), " genes")
+
+save_feature_plots(umap_obj, genes = PLOT_GENES,
+                   reduction = "umap", plotdir = "gene_umaps")
+save_feature_plots_split(umap_obj, genes = PLOT_GENES,
+                         reduction = "umap", plotdir = "gene_umaps")
+rm(umap_obj); invisible(gc(verbose = FALSE))
+```
+
+# Cell-type proportions
+
+**Cell-type composition by genotype.** Three figures.
+
+The **stacked bar** gives the full composition of each genotype, every cluster as a band whose height is its share of that genotype's nuclei. Both bars sum to 100%, so this shows relative composition and not absolute cell numbers.
+
+The **grouped bar** collapses the layer clusters into upper-layer, deep-layer and the DKO-specific population, which is the comparison the reviewer's question is about.
+
+The **dot plot** shows, for every cluster, the log2 ratio of its mutant to wild-type proportion: right of the dashed line means enriched in the mutant, left means depleted, and point size reflects how common the cluster is. Its usefulness here is the spread — values on both sides of zero cannot be produced by a uniform difference in cell recovery.
+
+All of this is descriptive: with one animal per genotype these proportions are single observations and no significance test is valid.
+
+```{r proportion_analysis}
+# =============================================================================
+# Compositional shift, DKO vs WT. DESCRIPTIVE ONLY: with n = 1 per genotype the
+# proportions are single observations, so no significance test is valid (a
+# cell-level test would be pseudoreplicated). We report counts, within-genotype
+# proportions and the DKO/WT ratio.
+# =============================================================================
+comp <- sc_seurat@meta.data %>%
+  dplyr::count(cluster_named, Genotype, name = "n_cells") %>%
+  tidyr::pivot_wider(names_from = Genotype, values_from = n_cells, values_fill = 0) %>%
+  mutate(prop_WT    = .data[[WT_LAB]] / tot_WT,
+         prop_DKO   = .data[[DKO]]    / tot_DKO,
+         log2_ratio = log2((prop_DKO + 1e-4) / (prop_WT + 1e-4)),
+         pct_WT     = round(100 * prop_WT, 2),
+         pct_DKO    = round(100 * prop_DKO, 2)) %>%
+  arrange(desc(log2_ratio))
+
+save_table(comp, "celltype_proportions_DKO_vs_WT.csv")
+print(comp %>% dplyr::select(cluster_named, !!WT_LAB, !!DKO,
+                             pct_WT, pct_DKO, log2_ratio))
+
+# ---- Upper-layer vs deep-layer summary ----
+UL_CLUSTERS <- c("Layer II/III", "Layer IV")
+DL_CLUSTERS <- c("Layer V", "Layer VI", "Layer VIb")
+FATE_LEVELS <- c("Upper-layer (UL)", "Deep-layer (DL)", PRIVATE_CLUSTERS)
+
+fate_summary <- sc_seurat@meta.data %>%
+  mutate(fate = dplyr::case_when(
+    cluster_named %in% UL_CLUSTERS      ~ "Upper-layer (UL)",
+    cluster_named %in% DL_CLUSTERS      ~ "Deep-layer (DL)",
+    cluster_named %in% PRIVATE_CLUSTERS ~ as.character(cluster_named),
+    TRUE ~ "Other")) %>%
+  dplyr::filter(fate != "Other") %>%
+  dplyr::count(fate, Genotype, name = "n_cells") %>%
+  tidyr::pivot_wider(names_from = Genotype, values_from = n_cells, values_fill = 0) %>%
+  mutate(prop_WT    = .data[[WT_LAB]] / tot_WT,
+         prop_DKO   = .data[[DKO]]    / tot_DKO,
+         pct_WT     = round(100 * prop_WT, 2),
+         pct_DKO    = round(100 * prop_DKO, 2),
+         log2_ratio = round(log2((prop_DKO + 1e-4) / (prop_WT + 1e-4)), 3)) %>%
+  arrange(desc(log2_ratio))
+
+print(fate_summary)
+save_table(fate_summary, "UL_DL_fate_proportions.csv")
+
+# ---- 1. Stacked composition, every cluster ----
+comp_long <- sc_seurat@meta.data %>%
+  dplyr::count(cluster_named, Genotype, name = "n") %>%
+  group_by(Genotype) %>% mutate(prop = n / sum(n)) %>% ungroup()
+
+# The stacked bar carries ~20 categories, so the default hue wheel makes
+# neighbouring segments hard to tell apart. Use a divergent HCL ramp across the
+# ordered cluster levels and separate the segments with thin white borders.
+# (The UMAPs and heatmap annotations keep the Seurat default palette.)
+# "Spectral" is diverging and puts several near-white colours in the middle of
+# a 20+ category ramp, which read as missing segments (Layer IV looked
+# transparent). "Zissou 1" spans the same warm-to-cool range with a maximum
+# luminance of 0.78, so every category stays visible.
+STACK_PALETTE <- setNames(
+  grDevices::hcl.colors(nlevels(comp_long$cluster_named), "Zissou 1"),
+  levels(comp_long$cluster_named))
+
+p_stack <- ggplot(comp_long, aes(x = Genotype, y = prop, fill = cluster_named)) +
+  geom_col(position = "stack", colour = "white", linewidth = 0.15) +
+  scale_fill_manual(values = STACK_PALETTE) +
+  labs(y = "Proportion of cells", x = NULL, fill = "Cluster",
+       title = "Cell-type composition by genotype (n=1 each; descriptive)") +
+  theme_minimal() +
+  theme(legend.text = element_text(size = 7), legend.key.size = unit(3, "mm"))
+save_plot(p_stack, "proportions/composition_stacked.pdf", 7, 8)
+
+# ---- 2. UL / DL / Misspecified grouped bar ----
+# Levels are taken from FATE_LEVELS, which is built from PRIVATE_CLUSTERS. In the
+# 2026 file this list was hardcoded to "Misspecified" while case_when() emitted
+# "Misspecified UL"/"DL", so those bars silently dropped out as NA.
+fate_long <- fate_summary %>%
+  dplyr::select(fate, pct_WT, pct_DKO) %>%
+  tidyr::pivot_longer(c(pct_WT, pct_DKO), names_to = "Genotype", values_to = "pct") %>%
+  mutate(Genotype = ifelse(Genotype == "pct_WT", "WT", "DKO"),
+         Genotype = factor(Genotype, levels = c("WT", "DKO")),
+         fate     = factor(fate, levels = FATE_LEVELS))
+stopifnot(!any(is.na(fate_long$fate)))
+
+p_fate <- ggplot(fate_long, aes(x = fate, y = pct, fill = Genotype)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  scale_fill_manual(values = c("WT" = "grey70", "DKO" = "firebrick")) +
+  labs(y = "% of genotype's cells", x = NULL,
+       title = "UL vs DL neuronal proportions (n=1 each; descriptive)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+save_plot(p_fate, "proportions/UL_DL_fate_barplot.pdf", 6, 5)
+
+# ---- 3. log2-ratio dotplot: which clusters expand or contract in DKO ----
+p_ratio <- comp %>%
+  mutate(cluster_named = factor(cluster_named,
+                                levels = cluster_named[order(log2_ratio)])) %>%
+  ggplot(aes(x = log2_ratio, y = cluster_named,
+             color = log2_ratio > 0, size = pmax(pct_WT, pct_DKO))) +
+  geom_point() + geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c("FALSE" = "steelblue", "TRUE" = "firebrick"),
+                     labels = c("Depleted in DKO", "Enriched in DKO"), name = NULL) +
+  labs(x = "log2(DKO prop / WT prop)", y = NULL, size = "max % cells",
+       title = "Compositional shift by cluster (n=1 each; descriptive)") +
+  theme_minimal()
+save_plot(p_ratio, "proportions/compositional_shift_dotplot.pdf", 7, 7)
+
+message("Proportion analysis complete. NOTE: single replicate per genotype - ",
+        "proportions are descriptive, no significance test is valid.")
+```
+
+# Interneurons
+
+**Interneuron changes.** The printed tables report whether *Neurod2* and *Neurod6* are expressed in the interneuron clusters at all, and how many genes change substantially in each.
+
+The figure is an **MA-style plot**, one panel per interneuron cluster: x-axis is mean expression, y-axis is the log2 fold-change, dashed lines mark the two-fold threshold, and points beyond it are highlighted. It is deliberately not a volcano plot — there are no p-values to put on a y-axis here — so read it as effect size against expression level, where changes at low expression are the least trustworthy.
+
+```{r interneuron_analysis}
+in_present <- intersect(INTERNEURON_CLUSTERS, CLUSTERS_PRESENT)
+
+# ---- Are Neurod2/Neurod6 actually expressed in interneurons here? ----
+# The reviewer notes they are "weakly expressed"; confirm in this data before
+# interpreting any interneuron effect. Pyramidal clusters included as reference.
+nd_genes <- intersect(c("Neurod2", "Neurod6"), rownames(sc_seurat))
+nd_expr <- FetchData(sc_seurat, vars = c(nd_genes, "cluster_named", "Genotype")) %>%
+  dplyr::filter(cluster_named %in% c(in_present, "Layer V", "Layer II/III")) %>%
+  tidyr::pivot_longer(all_of(nd_genes), names_to = "gene", values_to = "expr") %>%
+  group_by(cluster_named, Genotype, gene) %>%
+  summarise(mean_expr = mean(expr), pct_expr = 100 * mean(expr > 0), .groups = "drop")
+save_table(nd_expr, "interneuron_NeuroD_expression.csv")
+print(nd_expr)
+
+# ---- Pseudobulk DKO-vs-WT per interneuron cluster ----
+# These are shared clusters with both genotypes present, so the within-cluster
+# contrast IS defined here, unlike the Misspecified cluster.
+interneuron_DE <- DE_combined_all %>%
+  dplyr::filter(cluster_named %in% in_present, comparison == "DKO_vs_WT")
+
+if (!nrow(interneuron_DE)) {
+  message("No interneuron clusters passed the pseudobulk cell-count threshold.")
+} else {
+  save_table(interneuron_DE, "interneuron_DKO_vs_WT_pseudobulk.csv")
+
+  change_summary <- interneuron_DE %>%
+    dplyr::filter(mean_cpm > 5) %>%
+    group_by(cluster_named) %>%
+    summarise(n_tested       = n(),
+              n_up_fc1       = sum(avg_log2FC >  1, na.rm = TRUE),
+              n_down_fc1     = sum(avg_log2FC < -1, na.rm = TRUE),
+              max_abs_log2FC = round(max(abs(avg_log2FC), na.rm = TRUE), 2),
+              .groups = "drop")
+  print(change_summary)
+  save_table(change_summary, "interneuron_change_summary.csv")
+
+  top_changed <- interneuron_DE %>%
+    dplyr::filter(mean_cpm > 5) %>%
+    group_by(cluster_named) %>%
+    slice_max(abs(avg_log2FC), n = 20) %>%
+    arrange(cluster_named, desc(avg_log2FC)) %>%
+    dplyr::select(cluster_named, gene, avg_log2FC, cpm_WT, cpm_DKO, mean_cpm)
+  save_table(top_changed, "interneuron_top_changed_genes.csv")
+
+  # MA-style plot per cluster (log2FC vs mean expression - there are no p-values)
+  p_ma <- interneuron_DE %>%
+    dplyr::filter(mean_cpm > 1) %>%
+    mutate(changed = abs(avg_log2FC) > 1) %>%
+    ggplot(aes(x = log2(mean_cpm + 1), y = avg_log2FC, color = changed)) +
+    geom_point(alpha = 0.4, size = 0.6) +
+    geom_hline(yintercept = c(-1, 1), linetype = "dashed") +
+    scale_color_manual(values = c("FALSE" = "grey70", "TRUE" = "firebrick"),
+                       labels = c("|log2FC|<=1", "|log2FC|>1"), name = NULL) +
+    facet_wrap(~cluster_named) +
+    labs(x = "log2(mean CPM + 1)", y = "log2FC (DKO vs WT)",
+         title = "Interneuron DKO-vs-WT changes (descriptive; n=1 per genotype)") +
+    theme_minimal()
+  save_plot(p_ma, "interneurons/interneuron_MA_plots.pdf", 10, 4)
+}
+
+# ---- Surface the interneuron GSEA results already computed above ----
+for (cl in intersect(in_present, names(gsea_results))) {
+  df <- get_gsea_df(gsea_results[[cl]]) %>%
+    dplyr::filter(!is.na(p.adjust)) %>% arrange(p.adjust) %>% head(20)
+  if (nrow(df)) {
+    save_table(df %>% dplyr::select(dplyr::any_of(
+                 c("ID", "Description", "NES", "p.adjust", "setSize"))),
+               file.path("interneurons",
+                         paste0("interneuron_GSEA_", safe_name(cl), ".csv")))
+  }
+}
+```
+
+# Session
+
+Resets the parallel plan, confirms the input object was not modified during the run, and records package versions for reproducibility.
+
+```{r session_info}
+future::plan(future::sequential)   # do not leak a parallel plan out of the notebook
+
+# The input object must be byte-identical to what we started with.
+cat("Input .rds unchanged:",
+    identical(tools::md5sum(RDS_PATH)[[1]], "be1d0e281dacfdfb2b26d655d8860250"), "\n")
+
+sessionInfo()
+```

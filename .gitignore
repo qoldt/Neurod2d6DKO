@@ -1,0 +1,20 @@
+# Input object - too large for GitHub, distributed via Google Drive (see README)
+*.rds
+
+# Generated outputs. Both notebooks write plots/ and tables/ into their own
+# analysis directory, and knitting writes the HTML report alongside the .Rmd.
+plots/
+tables/
+*.html
+*_files/
+*_cache/
+
+# R
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# macOS
+.DS_Store
