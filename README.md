@@ -20,8 +20,6 @@ figure and table are distributed separately — see [Data](#data) and
 00_preprocessing_make_rds.R                            provenance for the input object
 1_misspecified_cluster/scNeuroD_DKO_1misspecified.Rmd  primary analysis  (res 0.5)
 2_misspecified_clusters/scNeuroD_DKO_2misspecified.Rmd companion analysis (res 0.9)
-scNeuroD2025.Rmd                                       superseded predecessor
-scNeuroD_DKO_2026_revision.Rmd                         superseded predecessor
 ```
 
 ### `00_preprocessing_make_rds.R`
@@ -31,9 +29,8 @@ matrices → merge with genotype labels → QC metrics → filter → standard S
 workflow → per-genotype DoubletFinder → re-run workflow on the cleaned object
 (this is the stored res-0.5 clustering) → Azimuth against `mousecortexref`.
 
-It is **not** part of either notebook and is not re-run by them. It is extracted
-verbatim from the `seurat_standard` chunk of `scNeuroD_DKO_2026_revision.Rmd`,
-the file that originally wrote the object, and is kept separate because it needs
+It is **not** part of either notebook and is not re-run by them. It records
+verbatim the code that produced the object, and is kept separate because it needs
 things the analysis does not: the Cell Ranger outputs on a network volume, and
 the `DoubletFinder`, `Azimuth`, `celldex` and `glmGamPoi` packages. A guard at
 the top refuses to overwrite an existing object, so an accidental `source()`
@@ -69,30 +66,6 @@ real but is not an expansion of Layer VIb itself. The primary analysis is the
 more conservative description — it does not subdivide a population on the basis
 of one animal per genotype — and the companion analysis is what makes the nature
 of that expansion interpretable.
-
-### Superseded predecessors
-
-`scNeuroD2025.Rmd` (the 2025 analysis) and `scNeuroD_DKO_2026_revision.Rmd` (the
-2026 revision) are kept for provenance — the two current notebooks were merged
-from them. **Neither is the analysis of record**, and `scNeuroD_DKO_2026_revision.Rmd`
-no longer runs as written. Fixes made relative to it are documented inline in
-the current notebooks; the ones that changed results were:
-
-- The cell-level detection-specificity guard was computed **pooled across all
-  cells** and then thresholded at `|pct_DKO − pct_WT| > 0.3`. Pooling averages a
-  cluster-specific detection difference over the whole dataset and destroys it —
-  the largest pooled difference for any gene in this data is 0.2115, so the gate
-  admitted **zero** genes and every shared-cluster gene was silently dropped from
-  the heatmaps. The DE contrast is within-cluster, so the guard now is too; the
-  same 0.3 threshold then admits 132 genes.
-- `FATE_LEVELS` was hardcoded to `"Misspecified"` while `case_when()` emitted
-  `"Misspecified UL"` / `"Misspecified DL"`, so those bars dropped out as `NA`.
-- Violin sections 4 and 5 iterated a leftover 9-gene scratch vector named `temp`
-  instead of the real gene set.
-- The ORA `minGSSize` of 10 left only 4 of 14 clusters contributing any term, so
-  the summary dotplot was effectively the misspecified cluster alone; at 5 it is
-  12 of 14.
-- A hardcoded 21-colour vector broke silently once the cluster count changed.
 
 ---
 
@@ -240,31 +213,3 @@ plots/{dimplots,proportions,heatmaps,GSEA,enrichGO,Violin,gene_umaps,
 tables/{celltype_proportions,cluster_cell_counts,Genotype_changes,QC_*,
         layer_*,interneuron_*,GSEA/,enrichGO/,interneurons/}
 ```
-
----
-
-## Reviewer comments addressed
-
-1. **Is "expansion of UL neurons at the expense of DL neurons" correct?**
-   Analysed by cell-type proportion and, independently of clustering, by
-   layer-marker expression. Neither compartment expands — upper-layer nuclei fall
-   from 16.2% to 9.6% and deep-layer from 26.8% to 19.8%. The dominant feature is
-   a DKO-specific population that acquires no coherent layer identity, and the
-   layer changes that remain are not organised along the UL/DL axis.
-2. **Molecular alterations in cortical interneurons?** Neurod2/Neurod6 detection
-   was first confirmed in this dataset across every cluster and both genotypes,
-   then interneuron clusters — which have both genotypes present, so the
-   within-cluster contrast *is* defined — were tested by pseudobulk DKO-vs-WT
-   and GSEA.
-3. **>2× more mutant nuclei recovered; genes per nucleus?** Reported per cluster
-   and per genotype. This point does not depend on clustering at all.
-4. **Layer VI reduced but Layer VIb and Layer V massively expanded.** Addressed
-   by the resolution comparison described above, plus the argument that a uniform
-   recovery bias cannot produce shifts in both directions: a scaling factor would
-   multiply every cluster equally and cancel entirely when proportions are taken
-   within genotype. Across the 21 clusters of the res-0.9 analysis the log2
-   ratios instead span −2.14 to +9.55, with 5 clusters enriched (log2 > 0.5) and
-   12 depleted (log2 < −0.5) in the mutant.
-
-A written response to each point, at both resolutions, accompanies the
-manuscript revision.

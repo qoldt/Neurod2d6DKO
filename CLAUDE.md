@@ -168,12 +168,6 @@ Code only. `.gitignore` covers `*.rds`, `plots/`, `tables/`, `*.html`. Do not
 commit generated output — it is ~3.8 GB and ~14,900 PDFs — and do not commit the
 524 MB input object; it is distributed via Google Drive.
 
-`scNeuroD2025.Rmd` and `scNeuroD_DKO_2026_revision.Rmd` are **archival
-provenance**, kept because the current notebooks were merged from them.
-`scNeuroD_DKO_2026_revision.Rmd` no longer runs as written. Do not fix, lint or
-modernise them — their value is being the record of what was run. Fixes belong
-in the two current notebooks, documented inline.
-
 ## Before you claim something works
 
 Rendering succeeds does not mean the analysis is right — the bugs that mattered
