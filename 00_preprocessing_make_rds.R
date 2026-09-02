@@ -5,9 +5,10 @@
 # either notebook and is NOT re-run as part of them: the .rds already exists and
 # is treated as read-only input.
 #
-# Extracted verbatim from the `seurat_standard` chunk of
-# scNeuroD_DKO_2026_revision.Rmd (the file that wrote this .rds). Kept as a
-# separate script because it needs things the analysis does not:
+# Extracted verbatim from the `seurat_standard` chunk of scNeuroD_DKO_2026.Rmd,
+# the file that wrote this .rds, plus the set.seed(42) from the chunk before it
+# (see below). That chunk is byte-identical in scNeuroD_DKO_2026_revision.Rmd.
+# Kept as a separate script because it needs things the analysis does not:
 #
 #   * the Cell Ranger outputs (a network volume; see NEUROD_CELLRANGER_DIR)
 #   * packages that are NOT installed here and are not needed downstream:
@@ -59,6 +60,11 @@ library(future)
 library(DoubletFinder)  
 library(dplyr)          
 
+# Restored from the `install` chunk, which ran in the same session immediately
+# before `seurat_standard` and is therefore part of the original run even though
+# it sits outside the extracted chunk. DoubletFinder's simulated doublets, UMAP
+# and the Louvain clustering all draw on this.
+set.seed(42)
 
 plotdir <- file.path(PROJ_DIR, "plots", "preprocessing")
 dir.create(plotdir, recursive = TRUE, showWarnings = FALSE)

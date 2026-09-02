@@ -148,12 +148,15 @@ export NEUROD_CELLRANGER_DIR=/path/to/cellranger_outputs
 Rscript 00_preprocessing_make_rds.R
 ```
 
-> **This will not reproduce the archived object bit for bit.** DoubletFinder's
-> simulated doublets, UMAP and the Louvain clustering are all stochastic and the
-> script sets no seed, so a rebuild yields a slightly different clustering. The
-> notebooks assert exact per-cluster cell counts and will therefore stop rather
-> than relabel — which is the intended behaviour. To reproduce the published
-> figures, use the Google Drive object above and check its md5.
+> **A rebuild may not reproduce the archived object exactly.** The original run
+> was seeded — `set.seed(42)`, restored in the script from the chunk that ran
+> immediately before the preprocessing code — but that alone does not guarantee
+> it. `plan("multicore")` means DoubletFinder and parts of the Seurat workflow
+> draw random numbers inside forked workers, whose streams a top-level seed does
+> not control, and clustering also shifts with Seurat and Bioconductor versions.
+> The notebooks assert exact per-cluster cell counts, so they stop rather than
+> relabel if the clustering has moved — the intended behaviour. To reproduce the
+> published figures, use the Google Drive object above and check its md5.
 
 ---
 
