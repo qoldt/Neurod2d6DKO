@@ -117,9 +117,10 @@ silently dropped out as `NA`.
   `ggsave()` or `write.csv()` directly.
 - **Paths come from `PROJ_DIR` / `ANALYSIS_DIR`, never `setwd()`.** knitr resets
   the working directory after every chunk.
-- `PROJ_DIR` still points at the original SynologyDrive path. This is
-  intentional — the code matches the run that produced the archived figures.
-  Repoint it locally to run; don't commit a change to it without saying so.
+- **No absolute paths anywhere.** `ANALYSIS_DIR` is derived from the notebook's
+  own location via `knitr::current_input()`, and `PROJ_DIR` is its parent. Don't
+  reintroduce a hardcoded path or a `setwd()`; if something needs to live
+  elsewhere, use the `NEUROD_PROJ_DIR` / `NEUROD_RDS` overrides.
 - Chunks are quiet by default. A full run emits ~500 lines of incidental
   Seurat/ggplot2/clusterProfiler notes that bury the real output. Chunks whose
   log is worth reading opt in with `message=TRUE` in the header.

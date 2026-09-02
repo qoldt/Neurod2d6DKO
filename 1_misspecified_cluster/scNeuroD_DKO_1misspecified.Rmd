@@ -43,7 +43,7 @@ DoubletFinder and Azimuth - everything that produced the .rds this notebook
 reads - lives in ../00_preprocessing_make_rds.R, extracted verbatim from the
 `seurat_standard` chunk of scNeuroD_DKO_2026_revision.Rmd. That script refuses to
 overwrite the existing object and needs packages not installed here (Azimuth,
-DoubletFinder, celldex) plus the Cell Ranger outputs on /Volumes/centren.
+DoubletFinder, celldex) plus the Cell Ranger outputs (NEUROD_CELLRANGER_DIR).
 ==============================================================================
 -->
 
@@ -61,11 +61,18 @@ knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
                       dev = "png", dpi = 110, out.width = "100%")
 
 # knitr resets the working directory after every chunk, so every path below is
-# built from these constants rather than from setwd(). The input object lives at
-# the project root and is shared with the two-cluster analysis; all OUTPUT stays
-# inside this analysis directory.
-PROJ_DIR     <- path.expand("~/SynologyDrive/NeuroD_2024/Revision July 28")
-ANALYSIS_DIR <- file.path(PROJ_DIR, "1_misspecified_cluster")
+# built from these constants rather than from setwd().
+#
+# Both are DERIVED from this file's own location, so the repository runs wherever
+# it is cloned and contains no absolute paths: ANALYSIS_DIR is the directory
+# holding this notebook, PROJ_DIR the repository root one level up. The input
+# .rds lives at PROJ_DIR and is shared with the other analysis; all OUTPUT stays
+# inside ANALYSIS_DIR. Set NEUROD_PROJ_DIR to override.
+ANALYSIS_DIR <- local({
+  f <- knitr::current_input(dir = TRUE)   # set while knitting, NULL otherwise
+  normalizePath(if (is.null(f)) getwd() else dirname(f), mustWork = TRUE)
+})
+PROJ_DIR <- Sys.getenv("NEUROD_PROJ_DIR", unset = dirname(ANALYSIS_DIR))
 knitr::opts_knit$set(root.dir = ANALYSIS_DIR)
 ```
 
@@ -98,13 +105,24 @@ set.seed(42)
 # Paths. The input .rds is READ-ONLY and shared with the two-cluster analysis;
 # every output goes under this analysis directory as plots/ and tables/.
 # ---------------------------------------------------------------------------
-RDS_PATH  <- file.path(PROJ_DIR, "scNeuroD_DKO_2025_doublet_Removed_azimuth.rds")
+RDS_NAME  <- "scNeuroD_DKO_2025_doublet_Removed_azimuth.rds"
+RDS_PATH  <- Sys.getenv("NEUROD_RDS", unset = file.path(PROJ_DIR, RDS_NAME))
 PLOT_DIR  <- file.path(ANALYSIS_DIR, "plots")
 TABLE_DIR <- file.path(ANALYSIS_DIR, "tables")
 dir.create(PLOT_DIR,  recursive = TRUE, showWarnings = FALSE)
 dir.create(TABLE_DIR, recursive = TRUE, showWarnings = FALSE)
 
-stopifnot(file.exists(RDS_PATH))
+# The object is 524 MB and is not in the repository. This is the first thing a
+# fresh clone hits, so fail with instructions rather than a bare assertion.
+if (!file.exists(RDS_PATH)) {
+  stop("Input object not found:\n  ", RDS_PATH,
+       "\n\nDownload it (524 MB) to the repository root:\n",
+       "  pip install gdown\n",
+       "  gdown 1selJ4Y-o35d2nNGO4i4TDaafdXfyn5he -O \"",
+       file.path(PROJ_DIR, RDS_NAME), "\"\n\n",
+       "Expected md5: be1d0e281dacfdfb2b26d655d8860250\n",
+       "Or set NEUROD_RDS to an existing copy.", call. = FALSE)
+}
 
 # ---------------------------------------------------------------------------
 # Output helpers. Every plot and table in this file goes through these, so the

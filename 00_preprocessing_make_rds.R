@@ -9,7 +9,7 @@
 # scNeuroD_DKO_2026_revision.Rmd (the file that wrote this .rds). Kept as a
 # separate script because it needs things the analysis does not:
 #
-#   * the Cell Ranger outputs on /Volumes/centren (network volume)
+#   * the Cell Ranger outputs (a network volume; see NEUROD_CELLRANGER_DIR)
 #   * packages that are NOT installed here and are not needed downstream:
 #       DoubletFinder  (github: chris-mcginnis-ucsf/DoubletFinder)
 #       Azimuth        (github: satijalab/azimuth - not on CRAN/Bioconductor)
@@ -26,18 +26,27 @@
 # overwrite it, so an accidental source() cannot destroy the analysis input.
 # =============================================================================
 
-OUT_RDS <- file.path(path.expand("~/SynologyDrive/NeuroD_2024"),
-                     "scNeuroD_DKO_2025_doublet_Removed_azimuth.rds")
-# A second copy of the object lives in the revision folder and is what the two
-# notebooks actually read; guard both so neither can be clobbered accidentally.
-GUARDED_RDS <- c(OUT_RDS,
-                 file.path(path.expand("~/SynologyDrive/NeuroD_2024/Revision July 28"),
-                           "scNeuroD_DKO_2025_doublet_Removed_azimuth.rds"))
-if (any(file.exists(GUARDED_RDS))) {
-  stop("Refusing to run - the analysis object already exists:\n  ",
-       paste(GUARDED_RDS[file.exists(GUARDED_RDS)], collapse = "\n  "),
+# ---------------------------------------------------------------------------
+# Paths. PROJ_DIR is the repository root - this script lives there - so nothing
+# below is an absolute path. Override with NEUROD_PROJ_DIR.
+#
+# The Cell Ranger run directory is machine-specific and has no sensible default,
+# so it must be supplied as NEUROD_CELLRANGER_DIR: the folder holding the
+# per-sample output directories A4794_SP278_NeuroD2_D6DKO/ and A4794_SP278_wt/.
+# ---------------------------------------------------------------------------
+PROJ_DIR <- Sys.getenv("NEUROD_PROJ_DIR", unset = normalizePath(getwd()))
+OUT_RDS  <- file.path(PROJ_DIR, "scNeuroD_DKO_2025_doublet_Removed_azimuth.rds")
+
+if (file.exists(OUT_RDS)) {
+  stop("Refusing to run - the analysis object already exists:\n  ", OUT_RDS,
        "\n  Both notebooks read this file. Move it aside first if you really ",
-       "want to regenerate it.")
+       "want to regenerate it.", call. = FALSE)
+}
+
+cellranger_dir <- Sys.getenv("NEUROD_CELLRANGER_DIR")
+if (!nzchar(cellranger_dir)) {
+  stop("Set NEUROD_CELLRANGER_DIR to the directory containing the Cell Ranger ",
+       "outputs A4794_SP278_NeuroD2_D6DKO/ and A4794_SP278_wt/.", call. = FALSE)
 }
 
 library(Seurat)
@@ -51,14 +60,8 @@ library(DoubletFinder)
 library(dplyr)          
 
 
-# Set working directory 
-
-work_dir <- "~/SynologyDrive/NeuroD_2024/"
-setwd(work_dir)
-
-plotdir <- file.path(work_dir, "plots/revision")
-dir.create(plotdir, showWarnings = FALSE)
-cellranger_dir <- "/Volumes/centren/AG/AG-Newman/Newman/NeuroD scRNAseq/2024/A4794/"
+plotdir <- file.path(PROJ_DIR, "plots", "preprocessing")
+dir.create(plotdir, recursive = TRUE, showWarnings = FALSE)
 
 
 
@@ -108,7 +111,7 @@ sc_seurat <- CreateSeuratObject(
 #Remove sparse matrices to save RAM
 rm(NeuroD2_D6DKO,  WT)
 
-saveRDS(sc_seurat, file = file.path(work_dir, "seurat_pre_filter.rds"))
+saveRDS(sc_seurat, file = file.path(PROJ_DIR, "seurat_pre_filter.rds"))
 # Calculate QC metrics: percent of mitochondrial and ribosomal genes
 
 sc_seurat[["percent.mt"]] <- PercentageFeatureSet(sc_seurat, pattern = "^mt-")
@@ -259,4 +262,4 @@ DefaultAssay(sc_seurat) <- "RNA"
 sc_seurat <- NormalizeData(sc_seurat) 
 sc_seurat <- Azimuth::RunAzimuth(sc_seurat, reference = "mousecortexref")
 
-saveRDS(sc_seurat, file = file.path(work_dir,"scNeuroD_DKO_2025_doublet_Removed_azimuth.rds"))
+saveRDS(sc_seurat, file = OUT_RDS)

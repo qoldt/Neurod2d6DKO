@@ -103,32 +103,36 @@ that path; derived objects are saved under new names.
 
 ## Running
 
-Both notebooks build every path from two constants at the top of the file rather
-than from `setwd()`, because knitr resets the working directory after every
-chunk:
-
-```r
-PROJ_DIR     <- path.expand("~/SynologyDrive/NeuroD_2024/Revision July 28")
-ANALYSIS_DIR <- file.path(PROJ_DIR, "1_misspecified_cluster")
-```
-
-`PROJ_DIR` is the path on the machine the archived results were produced on, and
-has been **left unmodified** so the code matches the run that produced them.
-Point it at your clone, put the `.rds` there, and the notebooks are
-self-contained:
-
-```r
-PROJ_DIR <- path.expand("~/path/to/Neurod2d6DKO")
-```
-
-**Render with `Rscript`, not RStudio.** Forked parallelism requires a
-non-interactive session; under RStudio the fork plan silently falls back to
-`multisession`, which serialises the whole Seurat object to every worker.
+Clone it, put the `.rds` in the root, render. There are no absolute paths and
+nothing to edit:
 
 ```sh
+git clone https://github.com/qoldt/Neurod2d6DKO.git
+cd Neurod2d6DKO
+gdown 1selJ4Y-o35d2nNGO4i4TDaafdXfyn5he -O scNeuroD_DKO_2025_doublet_Removed_azimuth.rds
+
 Rscript -e 'rmarkdown::render("1_misspecified_cluster/scNeuroD_DKO_1misspecified.Rmd")'
 Rscript -e 'rmarkdown::render("2_misspecified_clusters/scNeuroD_DKO_2misspecified.Rmd")'
 ```
+
+Each notebook derives its paths from its own file location — `ANALYSIS_DIR` is
+the directory holding the notebook, `PROJ_DIR` the repository root one level up.
+They are constants rather than `setwd()` calls because knitr resets the working
+directory after every chunk. Outputs stay inside the notebook's own directory;
+the `.rds` is read from the root and never written to. If the object is missing,
+the run stops immediately with download instructions instead of failing
+somewhere downstream.
+
+Two environment variables override the defaults; neither is normally needed:
+
+| Variable | Effect |
+|---|---|
+| `NEUROD_PROJ_DIR` | Where the input object is looked for (default: repository root) |
+| `NEUROD_RDS` | Full path to the object, to use a copy kept elsewhere |
+
+**Render with `Rscript`, not RStudio** — as above. Forked parallelism requires a
+non-interactive session; under RStudio the fork plan silently falls back to
+`multisession`, which serialises the whole Seurat object to every worker.
 
 Each notebook writes `plots/` and `tables/` into its own directory and the HTML
 report alongside the `.Rmd`. All are gitignored.
@@ -147,9 +151,19 @@ Must be installed but are never referenced directly: `org.Mm.eg.db` (passed to
 ever serialised to a worker), `fgsea` (the estimator under `gseGO`), `magick`
 (see rasterisation below), and `rmarkdown` / `knitr` to render.
 
+`rmarkdown` needs **pandoc** on `PATH`. If you have RStudio but no standalone
+pandoc, point at RStudio's bundled copy before rendering:
+
+```sh
+export RSTUDIO_PANDOC=/Applications/RStudio.app/Contents/Resources/app/quarto/bin/tools/aarch64
+```
+
 `00_preprocessing_make_rds.R` additionally needs `DoubletFinder`
 (github: chris-mcginnis-ucsf/DoubletFinder), `Azimuth`
-(github: satijalab/azimuth), `celldex` and `glmGamPoi`.
+(github: satijalab/azimuth), `celldex` and `glmGamPoi`, plus
+`NEUROD_CELLRANGER_DIR` pointing at the Cell Ranger run directory. It is
+provenance, not part of either notebook, and refuses to overwrite an existing
+object.
 
 ### Machine notes
 
@@ -162,6 +176,11 @@ connection that is not safe to use concurrently. Nested parallelism is disabled
 inside workers — `fgsea` and `data.table` both grab every core by default, and
 combined with an outer `future_lapply` that oversubscribes to 100+ threads and
 runs slower than serial.
+
+**Verified** on R 4.6.1 / Seurat 5.5.1, macOS aarch64, 15 cores / 48 GB: both
+notebooks load the object and pass their cluster-naming assertions — 20 named
+clusters at res 0.5, 21 at res 0.9 reproducing the archived run, 39,267 nuclei
+in both.
 
 **Rasterisation.** `ComplexHeatmap` forces `type = "cairo"` whenever
 `capabilities("cairo")` is `TRUE`; on macOS without XQuartz that flag is `TRUE`
