@@ -66,7 +66,8 @@ dir.create(plotdir, recursive = TRUE, showWarnings = FALSE)
 
 
 # Load data
-# Adjust each path to point to the folder containing "raw_feature_bc_matrix"
+# Each path points to a Cell Ranger sample directory; the FILTERED matrix is
+# what is read (see NEUROD_CELLRANGER_DIR above, and the layout in the README).
 # This Data is from E15 cortex
 
 

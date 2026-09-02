@@ -71,6 +71,12 @@ of that expansion interpretable.
 
 ## Data
 
+Three things live outside this repository: the raw sequencing reads and the Cell
+Ranger outputs on NCBI GEO, and the analysis-ready Seurat object on Google Drive.
+Only the last of these is needed to run the notebooks.
+
+### Analysis-ready object (Google Drive)
+
 The input object is **524 MB** and is not in this repository.
 
 **Download:** [`scNeuroD_DKO_2025_doublet_Removed_azimuth.rds`](https://drive.google.com/file/d/1selJ4Y-o35d2nNGO4i4TDaafdXfyn5he/view?usp=sharing) (Google Drive)
@@ -98,6 +104,56 @@ md5sum scNeuroD_DKO_2025_doublet_Removed_azimuth.rds   # Linux
 
 The object is **read-only** to both notebooks. Nothing in either file writes to
 that path; derived objects are saved under new names.
+
+### Raw and processed sequencing data (NCBI GEO)
+
+<!-- GEO ACCESSIONS - fill in before release -->
+
+Raw reads and Cell Ranger outputs are deposited in NCBI GEO under
+**[GSEXXXXXX](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSEXXXXXX)**,
+BioProject **PRJNAXXXXXX**. Two samples, one animal per genotype, 10x Genomics
+3' single-nucleus RNA-seq of E15 mouse cortex.
+
+| GEO sample | Genotype | Nuclei after QC | Directory name the pipeline expects |
+|---|---|---|---|
+| GSMXXXXXXX | Wild type | 12,882 | `A4794_SP278_wt` |
+| GSMXXXXXXX | Neurod2/Neurod6 DKO | 26,385 | `A4794_SP278_NeuroD2_D6DKO` |
+
+**Raw FASTQ.** The 10x read files (`I1`, `R1`, `R2`) for each sample are in SRA,
+linked from the corresponding GSM record and downloadable in bulk from the
+BioProject:
+
+```sh
+prefetch SRRXXXXXXX
+fasterq-dump --split-files SRRXXXXXXX
+```
+
+**Processed Cell Ranger output.** Each GSM carries the *filtered* feature-barcode
+matrix as supplementary files — `barcodes.tsv.gz`, `features.tsv.gz`,
+`matrix.mtx.gz` — produced by Cell Ranger `X.Y.Z` against the
+`refdata-gex-mm10-XXXX-X` reference. These are the files
+`00_preprocessing_make_rds.R` reads; the notebooks themselves never touch them.
+
+**Rebuilding the object from GEO.** Arrange the downloaded matrices in the layout
+Cell Ranger produces, since the script addresses them by sample directory:
+
+```
+$NEUROD_CELLRANGER_DIR/
+├── A4794_SP278_wt/outs/filtered_feature_bc_matrix/{barcodes,features,matrix}
+└── A4794_SP278_NeuroD2_D6DKO/outs/filtered_feature_bc_matrix/{barcodes,features,matrix}
+```
+
+```sh
+export NEUROD_CELLRANGER_DIR=/path/to/cellranger_outputs
+Rscript 00_preprocessing_make_rds.R
+```
+
+> **This will not reproduce the archived object bit for bit.** DoubletFinder's
+> simulated doublets, UMAP and the Louvain clustering are all stochastic and the
+> script sets no seed, so a rebuild yields a slightly different clustering. The
+> notebooks assert exact per-cluster cell counts and will therefore stop rather
+> than relabel — which is the intended behaviour. To reproduce the published
+> figures, use the Google Drive object above and check its md5.
 
 ---
 
