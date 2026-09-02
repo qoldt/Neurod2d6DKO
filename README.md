@@ -100,7 +100,16 @@ the current notebooks; the ones that changed results were:
 
 The input object is **524 MB** and is not in this repository.
 
-**Download:** `scNeuroD_DKO_2025_doublet_Removed_azimuth.rds` — <!-- GOOGLE DRIVE LINK --> _link to be added_
+**Download:** [`scNeuroD_DKO_2025_doublet_Removed_azimuth.rds`](https://drive.google.com/file/d/1selJ4Y-o35d2nNGO4i4TDaafdXfyn5he/view?usp=sharing) (Google Drive)
+
+From the command line, use `gdown` — a plain `curl` of the link returns Google's
+virus-scan interstitial rather than the file, because it is over the 100 MB
+scan limit:
+
+```sh
+pip install gdown
+gdown 1selJ4Y-o35d2nNGO4i4TDaafdXfyn5he -O scNeuroD_DKO_2025_doublet_Removed_azimuth.rds
+```
 
 Verify the download before running anything — both notebooks assert this
 checksum at the end of the run to confirm the object was not modified:
