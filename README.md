@@ -1,7 +1,7 @@
 # NeuroD2/NeuroD6 DKO — E15 cortex snRNA-seq
 
 Analysis code for the supplemental single-nucleus RNA-seq in the Neurod2/Neurod6
-manuscript, written to answer the reviewer comments on that dataset.
+manuscript.
 
 Wild-type and Neurod2/Neurod6 double-knockout (DKO) E15 mouse cortex, one animal
 per genotype. After QC filtering (>400 genes, <5% mitochondrial reads), doublet
@@ -61,7 +61,7 @@ cell.
 mutant — 3.23% of WT nuclei against 10.04% of DKO nuclei. At res 0.9 that
 cluster separates into a genuine Layer VIb, which is in fact *reduced*
 (2.53% → 1.60%, 0.63×), and a DKO-specific Layer-VIb-like population enriched
-10.7× (0.75% → 7.99%). Same nuclei, two descriptions. The expansion a reviewer identified is
+10.7× (0.75% → 7.99%). Same nuclei, two descriptions. The apparent expansion is
 real but is not an expansion of Layer VIb itself. The primary analysis is the
 more conservative description — it does not subdivide a population on the basis
 of one animal per genotype — and the companion analysis is what makes the nature

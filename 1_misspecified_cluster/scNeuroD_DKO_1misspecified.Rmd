@@ -461,7 +461,7 @@ qc_clust <- sc_seurat@meta.data %>%
 save_table(qc_clust, "QC_genes_per_nucleus_by_cluster.csv")
 
 # Neurod2/Neurod6 detection in every cluster, both genotypes - backs the
-# interneuron answer (reviewer point 2) without restricting to interneurons.
+# interneuron analysis without restricting to interneurons.
 nd_all <- intersect(c("Neurod2", "Neurod6"), rownames(sc_seurat))
 qc_nd <- FetchData(sc_seurat, vars = c(nd_all, "cluster_named", "Genotype")) %>%
   tidyr::pivot_longer(all_of(nd_all), names_to = "gene", values_to = "expr") %>%
@@ -552,13 +552,13 @@ save_plot(p, "dimplots/Genotype_split_UMAP.pdf", 36, 18, units = "cm")
 
 # Composition is not explained by uneven cell recovery
 
-**Deep-layer composition, WT versus DKO.** A grouped bar chart of the layer clusters the reviewer asks about. The y-axis is the percentage of *that genotype's* nuclei, not a raw count, so the roughly two-fold difference in recovery cancels out by construction.
+**Deep-layer composition, WT versus DKO.** A grouped bar chart of the layer clusters of interest. The y-axis is the percentage of *that genotype's* nuclei, not a raw count, so the roughly two-fold difference in recovery cancels out by construction.
 
 The point of the figure is the direction of the bars: a uniform difference in how many nuclei were captured would move every cluster by the same factor and leave these percentages unchanged. Bars moving up for some clusters and down for others cannot be produced that way.
 
 ```{r recovery_independent_composition}
 # =============================================================================
-# Reviewer point: the deep-layer expansion / L6 reduction could be an artefact of
+# The deep-layer expansion / L6 reduction could be an artefact of
 # recovering roughly twice as many DKO cells. Proportions are within-genotype
 # fractions, so the recovery difference is normalised out by construction. If
 # recovery were the only difference every cluster would shift by the SAME factor.
@@ -2125,7 +2125,7 @@ rm(umap_obj); invisible(gc(verbose = FALSE))
 
 The **stacked bar** gives the full composition of each genotype, every cluster as a band whose height is its share of that genotype's nuclei. Both bars sum to 100%, so this shows relative composition and not absolute cell numbers.
 
-The **grouped bar** collapses the layer clusters into upper-layer, deep-layer and the DKO-specific population, which is the comparison the reviewer's question is about.
+The **grouped bar** collapses the layer clusters into upper-layer, deep-layer and the DKO-specific population, which is the comparison of interest.
 
 The **dot plot** shows, for every cluster, the log2 ratio of its mutant to wild-type proportion: right of the dashed line means enriched in the mutant, left means depleted, and point size reflects how common the cluster is. Its usefulness here is the spread — values on both sides of zero cannot be produced by a uniform difference in cell recovery.
 
@@ -2251,7 +2251,7 @@ The figure is an **MA-style plot**, one panel per interneuron cluster: x-axis is
 in_present <- intersect(INTERNEURON_CLUSTERS, CLUSTERS_PRESENT)
 
 # ---- Are Neurod2/Neurod6 actually expressed in interneurons here? ----
-# The reviewer notes they are "weakly expressed"; confirm in this data before
+# Both are reported as only weakly expressed here; confirm in this data before
 # interpreting any interneuron effect. Pyramidal clusters included as reference.
 nd_genes <- intersect(c("Neurod2", "Neurod6"), rownames(sc_seurat))
 nd_expr <- FetchData(sc_seurat, vars = c(nd_genes, "cluster_named", "Genotype")) %>%

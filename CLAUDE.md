@@ -3,7 +3,7 @@
 Guidance for working in this repository. The README describes *what* the
 analysis is; this file describes what will break if you are careless.
 
-This is analysis code backing a manuscript revision. Its output goes into a
+This is analysis code backing a manuscript. Its output goes into a
 paper. A silently wrong figure is far worse than a loud failure — several of the
 guards below exist because that already happened once.
 
